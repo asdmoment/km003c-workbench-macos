@@ -11,7 +11,17 @@ Rust/egui 提供适合长时间采样的中文仪表界面。
 > [WITRN-RS](https://github.com/KHWLGH/WITRN-RS) 交互思路；没有复制其源代码或
 > 受 GPL-3.0 保护的实现。
 
-当前 macOS 发布版：[`v0.1.0-20260919-2`](https://github.com/weixunkkkkk/km003c-workbench-macos/releases/tag/v0.1.0-20260919-2)。日期标签和同日构建序号用于区分同一 App 版本下的修订包，不改变 CSV/Parquet 数据契约。
+当前 macOS 发布版：[`v0.1.0-20261004`](https://github.com/weixunkkkkk/km003c-workbench-macos/releases/tag/v0.1.0-20261004)，App `0.1.0 (5)`。日期标签和同日构建序号用于区分同一 App 版本下的修订包，不改变 CSV/Parquet 数据契约。
+
+## 2026-10-04 修订
+
+- 新增“全程趋势／细节检查”：可独立查看电压、绝对值电流或绝对值功率，使用真实工程单位刻度。
+- 提供局部、从零和锁定量程，便于查看微小变化；锁定量程外的数据会明确提示。
+- 默认原始曲线，可选叠加五点中值趋势；原始峰值、游标、统计和导出数据保留。
+- 细节统计显示原始样本的最小、平均、最大、峰峰值和点数；较早历史仅有概览时明确标记，完整细节需保存后导入。
+- 仪表卡等高并收窄，统计集中到图表下方；改进中英文、小窗口及长时间轴的对齐和可读性。
+- 包含 KM002C USB 识别兼容，已做短时采样检查；长录制、PD 和离线链路仍待验证，固件升级尚未实现。
+- [完整更新说明与校验值](docs/RELEASE-NOTES-2026-10-04.md)。
 
 ## 2026-09-19 修订
 
@@ -53,7 +63,7 @@ Rust/egui 提供适合长时间采样的中文仪表界面。
 
 ### 使用 DMG
 
-从 [GitHub Releases](https://github.com/weixunkkkkk/km003c-workbench-macos/releases/tag/v0.1.0-20260919-2) 下载 Universal DMG，将“KM003C 工作台.app”拖到“应用程序”。当前版本使用 ad-hoc 签名、尚未进行 Developer ID 公证；首次打开时如果 macOS 显示安全提示，请在 Finder 中右键应用并选择“打开”。
+从 [GitHub Releases](https://github.com/weixunkkkkk/km003c-workbench-macos/releases/tag/v0.1.0-20261004) 下载 Universal DMG，将“KM003C 工作台.app”拖到“应用程序”。当前版本使用 ad-hoc 签名、尚未进行 Developer ID 公证；首次打开时如果 macOS 显示安全提示，请在 Finder 中右键应用并选择“打开”。
 
 ### 从源码运行
 

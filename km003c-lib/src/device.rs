@@ -139,6 +139,11 @@ impl fmt::Display for DeviceState {
 /// USB device identification constants
 pub const VID: u16 = 0x5FC9; // ChargerLAB vendor ID
 pub const PID: u16 = 0x0063; // KM003C product ID
+pub const PID_KM002C: u16 = 0x0061;
+
+fn supported_meter(vendor: u16, product: u16) -> bool {
+    vendor == VID && matches!(product, PID | PID_KM002C)
+}
 
 /// Interface 0 (Vendor Specific): Bulk transfers, fastest (~0.6ms)
 pub const INTERFACE_VENDOR: u8 = 0;
@@ -476,10 +481,10 @@ impl KM003C {
 
     /// Internal: Connect to USB device without initialization
     async fn connect(config: DeviceConfig) -> Result<Self, KMError> {
-        info!("Searching for POWER-Z KM003C...");
+        info!("Searching for POWER-Z KM003C/KM002C...");
         let device_info = nusb::list_devices()
             .await?
-            .find(|d| d.vendor_id() == VID && d.product_id() == PID)
+            .find(|d| supported_meter(d.vendor_id(), d.product_id()))
             .ok_or(KMError::DeviceNotFound)?;
 
         info!(
@@ -488,6 +493,8 @@ impl KM003C {
             device_info.device_address()
         );
 
+        let product_id = device_info.product_id();
+        let serial = device_info.serial_number().map(str::to_owned);
         let mut device = device_info.open().await?;
 
         // Optionally reset device (skip on MacOS if having issues)
@@ -500,7 +507,9 @@ impl KM003C {
             // Re-enumerate and reopen after reset (old handle may be invalid).
             let device_info = nusb::list_devices()
                 .await?
-                .find(|d| d.vendor_id() == VID && d.product_id() == PID)
+                .find(|d| {
+                    d.vendor_id() == VID && d.product_id() == product_id && d.serial_number() == serial.as_deref()
+                })
                 .ok_or(KMError::DeviceNotFound)?;
             device = device_info.open().await?;
         } else {
@@ -1269,6 +1278,15 @@ impl KM003C {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn supported_models_exclude_unknown_and_bootloader_devices() {
+        assert!(super::supported_meter(super::VID, 0x0061));
+        assert!(super::supported_meter(super::VID, 0x0063));
+        assert!(!super::supported_meter(super::VID, 0x0062));
+        assert!(!super::supported_meter(super::VID, 0x0000));
+        assert!(!super::supported_meter(0xffff, 0x0061));
+    }
+
     use super::*;
 
     #[test]

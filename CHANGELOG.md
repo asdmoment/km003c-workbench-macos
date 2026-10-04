@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0-20261004] - 2026-10-04
+
+App version `0.1.0 (5)`. CSV/Parquet retains the existing 23-column contract.
+
+### Added
+
+- Overview and Detail workspaces with independent U / |I| / |P| inspection,
+  local/zero-based/locked engineering ranges, and raw-sample detail statistics.
+- Explicit raw-cache boundaries and locked-range overflow notices.
+- KM002C USB identity matching (VID 5FC9 / PID 0061), with same-model and
+  serial-number matching after USB reset; unknown devices remain excluded.
+
+### Changed
+
+- Raw traces are the default; median trends overlay rather than replace them.
+- Equal-height, narrower readout cards; compact summaries and optional expanded
+  statistics leave more space for waveforms.
+- Stable 1/2/5 time ticks, range-aware cursor precision, and bilingual compact
+  layout improvements.
+
+### Validation and limits
+
+- GUI tests: 114 passed, 3 hardware/recording-dependent tests ignored; full
+  workspace tests, format checks, and strict Clippy passed during implementation.
+- Universal arm64/x86_64 builds, DMG verification and ad-hoc signature passed.
+- Recent raw cache remains limited to 100000 points. Older overview buckets do
+  not provide full raw detail; import the saved recording to inspect it.
+- Real-device background/lock-screen recording, full PD and KM002C long-session
+  acceptance remain pending. Firmware updating is not implemented.
+- DMG SHA-256: `a032fe941df58b86e04a331294337fac1b72705daa7084de124dbdab3daf3926`.
+
+See [release notes](docs/RELEASE-NOTES-2026-10-04.md).
+
 ## [0.1.0-20260919-2] - 2026-09-19
 
 This macOS application revision keeps the App version at `0.1.0` and uses a

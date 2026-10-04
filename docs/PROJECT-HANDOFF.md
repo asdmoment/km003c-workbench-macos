@@ -1,6 +1,6 @@
 # KM003C 工作台移交文档
 
-更新日期：2026-09-19。源码基线：`757d6f0`；本次工作区修订已提交到 `main`，并发布为 `v0.1.0-20260919-2`。
+更新日期：2026-10-04。当前发布标签：`v0.1.0-20261004`，App `0.1.0 (5)`；源码由该标签定位。最新说明见 [10 月 4 日更新说明](RELEASE-NOTES-2026-10-04.md) 和 [本地交付记录](RELEASE-2026-10-04-SIGNAL-DETAIL.md)。下方 9 月记录保留为历史追溯。
 
 ## 接手结论
 
@@ -17,7 +17,7 @@
 | 工作分支 | `macos-workbench`，跟踪 `github/main` |
 | 用户远程 | `github` |
 | 上游远程 | `origin` → `okhsunrog/km003c-rs` |
-| App 版本 | `0.1.0 (3)` |
+| App 版本 | `0.1.0 (5)` |
 | Cargo workspace 版本 | `0.3.0`，与 App 版本不同 |
 | Bundle ID | `com.weixun.km003cworkbench` |
 | 系统与架构 | macOS 11+，arm64 / x86_64 Universal |

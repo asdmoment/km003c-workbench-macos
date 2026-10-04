@@ -12,10 +12,26 @@
 </p>
 
 The latest macOS application revision is
-[`v0.1.0-20260919-2`](https://github.com/weixunkkkkk/km003c-workbench-macos/releases/tag/v0.1.0-20260919-2).
-It keeps App version `0.1.0 (3)` while using a date-suffixed tag and an optional
+[`v0.1.0-20261004`](https://github.com/weixunkkkkk/km003c-workbench-macos/releases/tag/v0.1.0-20261004).
+It keeps App version `0.1.0 (5)` while using a date-suffixed tag and an optional
 same-day build number to distinguish packaged revisions; the KM003C 23-column
 recording contract is unchanged.
+
+### October 4, 2026 revision
+
+- Overview and Detail workspaces, with independent voltage, absolute-current,
+  and absolute-power inspection in real engineering units.
+- Local, zero-based, and locked ranges expose small changes; locked-range
+  overflow is reported rather than clamped.
+- Raw traces remain visible. Optional median trends are overlays, and detail
+  statistics use original samples rather than decimated vertices.
+- Lighter, equal-height instrument cards, consolidated statistics, and stable
+  time ticks improve compact windows in Chinese and English.
+- Includes KM002C USB identification support; full hardware acceptance remains
+  pending and firmware updating is not available.
+
+See the [Chinese release notes](docs/RELEASE-NOTES-2026-10-04.md) for validation,
+data-cache limitations, installation, and the DMG checksum.
 
 ## Overview
 

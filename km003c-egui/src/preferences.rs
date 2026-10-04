@@ -101,8 +101,8 @@ pub(crate) enum WorkspaceTab {
 /// recording statistics and exported files always remain untouched.
 #[derive(Debug, Default, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) enum DisplayFilter {
-    Raw,
     #[default]
+    Raw,
     #[serde(alias = "Median3")]
     Median5,
 }
@@ -146,7 +146,7 @@ impl DisplayFilter {
     pub(crate) const fn localized_label(self, language: Language) -> &'static str {
         match self {
             Self::Raw => language.pick("原始曲线", "Raw traces"),
-            Self::Median5 => language.pick("五点中值降噪", "5-point median filter"),
+            Self::Median5 => language.pick("原始 + 中值趋势", "Raw + median trend"),
         }
     }
 }
@@ -208,7 +208,7 @@ impl Default for AppPreferences {
             visible_series: [true; 3],
             visible_accumulated_series: [true; 2],
             follow_latest: true,
-            display_filter: DisplayFilter::Median5,
+            display_filter: DisplayFilter::Raw,
             chart_scale_mode: ChartScaleMode::Actual,
         }
     }

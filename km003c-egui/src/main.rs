@@ -1,3 +1,4 @@
+mod chart_view;
 mod connection;
 mod i18n;
 mod measurement;
@@ -14,6 +15,7 @@ mod recording_session;
 mod sleep_assertion;
 mod theme;
 
+use chart_view::{ChartObservationMode, RangeMode, TraceRange};
 use chrono::Utc;
 use connection::ConnectionPhase;
 use eframe::egui;
@@ -401,6 +403,7 @@ impl AxisScale {
         value * self.maximum
     }
 
+    #[cfg(test)]
     fn presentation(self, unit: MeasurementUnit) -> EngineeringPresentation {
         EngineeringPresentation::for_maximum(self.maximum, unit)
     }
@@ -452,6 +455,19 @@ struct EngineeringPresentation {
 }
 
 impl EngineeringPresentation {
+    fn for_range(range: TraceRange, unit: MeasurementUnit) -> Self {
+        let mut presentation = Self::for_maximum(range.minimum.abs().max(range.maximum.abs()), unit);
+        // Tick precision follows the visible span, not the DC baseline. A
+        // 9.000–9.030 V view must not label every tick as just "9.00".
+        let tick = range.span().abs() * presentation.multiplier / 4.0;
+        presentation.decimals = if tick > 0.0 && tick.is_finite() {
+            (1.0 - tick.log10().floor()).clamp(0.0, 6.0) as usize
+        } else {
+            5
+        };
+        presentation
+    }
+
     fn for_maximum(maximum: f64, unit: MeasurementUnit) -> Self {
         let maximum = maximum.abs();
         let (multiplier, symbol) = if maximum > 0.0 && maximum < 0.0001 {
@@ -582,6 +598,23 @@ fn nice_axis_ceiling(value: f64) -> f64 {
         10.0
     };
     nice * magnitude
+}
+
+fn monitor_time_tick_step(base_step_size: f64) -> f64 {
+    // egui_plot's default grid_spacing.min is 8 pt. Reserve 110 pt for
+    // HH:MM:SS.t labels, then round up to stable 1/2/5 time intervals.
+    nice_axis_ceiling(base_step_size * (110.0 / 8.0)).max(0.1)
+}
+
+fn format_monitor_time_tick(mark: GridMark, range: &std::ops::RangeInclusive<f64>) -> String {
+    // Labels are centered on ticks. Keep half a label slot at both edges;
+    // precise endpoints remain visible in the full-session navigator.
+    let edge_margin = mark.step_size * 0.5;
+    if mark.value - range.start() < edge_margin || range.end() - mark.value < edge_margin {
+        String::new()
+    } else {
+        format_plot_time(mark.value)
+    }
 }
 
 fn uses_compact_monitor_layout(width: f32, height: f32) -> bool {
@@ -1456,6 +1489,11 @@ struct PowerMonitorApp {
     chart_follow_mode: ChartFollowMode,
     display_filter: DisplayFilter,
     chart_scale_mode: ChartScaleMode,
+    chart_observation_mode: ChartObservationMode,
+    detail_channel: usize,
+    detail_range_mode: RangeMode,
+    detail_locked_range: Option<(usize, TraceRange)>,
+    scope_statistics_expanded: bool,
     chart_viewport: ChartViewport,
     /// Absolute device-session time represented by 00:00:00.0 on the live
     /// plot. Starting a recording moves this origin without touching samples.
@@ -1680,8 +1718,13 @@ impl PowerMonitorApp {
             visible_series: [true; 3],
             visible_accumulated_series: [true; 2],
             chart_follow_mode: ChartFollowMode::LatestWindow,
-            display_filter: DisplayFilter::Median5,
+            display_filter: DisplayFilter::Raw,
             chart_scale_mode: ChartScaleMode::Actual,
+            chart_observation_mode: ChartObservationMode::Overview,
+            detail_channel: 1,
+            detail_range_mode: RangeMode::Local,
+            detail_locked_range: None,
+            scope_statistics_expanded: false,
             chart_viewport: ChartViewport::default(),
             live_plot_origin_seconds: 0.0,
             live_plot_origin_sample_index: None,
@@ -2688,54 +2731,65 @@ impl PowerMonitorApp {
         }
     }
 
-    fn show_cursor_readout_strip(&self, ui: &mut egui::Ui, readout: Option<CursorReadout>) {
+    fn show_cursor_readout_strip(
+        &self,
+        ui: &mut egui::Ui,
+        readout: Option<CursorReadout>,
+        detail_range: Option<TraceRange>,
+    ) {
         let language = self.language;
+        let detail = self.chart_observation_mode == ChartObservationMode::Detail;
         egui::Frame::NONE
             .fill(theme::panel_raised())
             .stroke(egui::Stroke::NONE)
             .corner_radius(egui::CornerRadius::same(6))
-            .inner_margin(egui::Margin::symmetric(10, 5))
+            .inner_margin(egui::Margin::symmetric(10, if detail { 3 } else { 5 }))
             .show(ui, |ui| {
-                ui.set_min_height(22.0);
+                ui.set_min_height(if detail { 16.0 } else { 22.0 });
                 if let Some(readout) = readout {
-                    let voltage = EngineeringPresentation::for_value(readout.voltage, MeasurementUnit::Voltage);
-                    let current = EngineeringPresentation::for_value(readout.current, MeasurementUnit::Current);
-                    let power = EngineeringPresentation::for_value(readout.power, MeasurementUnit::Power);
+                    let presentation = |channel, value, unit| {
+                        if channel == self.detail_channel
+                            && let Some(range) = detail_range
+                        {
+                            EngineeringPresentation::for_range(range, unit)
+                        } else {
+                            EngineeringPresentation::for_value(value, unit)
+                        }
+                    };
+                    let voltage = presentation(0, readout.voltage, MeasurementUnit::Voltage);
+                    let current = presentation(1, readout.current, MeasurementUnit::Current);
+                    let power = presentation(2, readout.power, MeasurementUnit::Power);
                     let energy = CumulativePresentation::for_maximum(
                         readout.cumulative_energy_uwh / 1_000.0,
                         CumulativeUnit::Energy,
                     );
                     let capacity =
                         CumulativePresentation::for_maximum(readout.capacity_uah / 1_000.0, CumulativeUnit::Capacity);
-                    let show_energy = self.visible_accumulated_series[0];
-                    let show_capacity = self.visible_accumulated_series[1];
+                    let show_cumulative =
+                        self.chart_observation_mode == ChartObservationMode::Overview && ui.available_width() >= 900.0;
+                    let show_energy = show_cumulative && self.visible_accumulated_series[0];
+                    let show_capacity = show_cumulative && self.visible_accumulated_series[1];
                     ui.columns(4 + usize::from(show_energy) + usize::from(show_capacity), |columns| {
                         let time_label = if readout.approximate {
                             language.pick("约值", "Approx.")
                         } else {
                             language.pick("游标", "Cursor")
                         };
-                        columns[0].label(
-                            egui::RichText::new(format!("{time_label}  {}", format_plot_time(readout.time_seconds)))
-                                .monospace()
-                                .strong()
-                                .color(theme::text_primary()),
+                        columns[0].add(
+                            egui::Label::new(
+                                egui::RichText::new(format!("{time_label} {}", format_plot_time(readout.time_seconds)))
+                                    .monospace()
+                                    .size(11.0)
+                                    .strong()
+                                    .color(theme::text_primary()),
+                            )
+                            .truncate(),
                         );
                         let mut column = 1;
                         for (label, value, presentation, color) in [
-                            (
-                                language.pick("电压", "Voltage"),
-                                readout.voltage,
-                                voltage,
-                                theme::VOLTAGE,
-                            ),
-                            (
-                                language.pick("电流", "Current"),
-                                readout.current,
-                                current,
-                                theme::CURRENT,
-                            ),
-                            (language.pick("功率", "Power"), readout.power, power, theme::POWER),
+                            ("U", readout.voltage, voltage, theme::VOLTAGE),
+                            ("I", readout.current, current, theme::CURRENT),
+                            ("P", readout.power, power, theme::POWER),
                         ] {
                             columns[column].colored_label(
                                 color,
@@ -2745,6 +2799,7 @@ impl PowerMonitorApp {
                                     presentation.symbol
                                 ))
                                 .monospace()
+                                .size(11.0)
                                 .strong(),
                             );
                             column += 1;
@@ -2754,11 +2809,12 @@ impl PowerMonitorApp {
                                 theme::ENERGY,
                                 egui::RichText::new(format!(
                                     "{}  {} {}",
-                                    language.pick("累计能量", "Energy"),
+                                    "E",
                                     energy.format_value(readout.cumulative_energy_uwh / 1_000.0),
                                     energy.symbol,
                                 ))
                                 .monospace()
+                                .size(11.0)
                                 .strong(),
                             );
                             column += 1;
@@ -2768,11 +2824,12 @@ impl PowerMonitorApp {
                                 theme::CAPACITY,
                                 egui::RichText::new(format!(
                                     "{}  {} {}",
-                                    language.pick("累计容量", "Capacity"),
+                                    "Q",
                                     capacity.format_value(readout.capacity_uah / 1_000.0),
                                     capacity.symbol,
                                 ))
                                 .monospace()
+                                .size(11.0)
                                 .strong(),
                             );
                         }
@@ -4419,7 +4476,8 @@ impl PowerMonitorApp {
                     .front()
                     .map_or(f64::INFINITY, |sample| sample.elapsed_seconds());
                 for point in &self.navigator_history.points {
-                    if point.time_seconds + f64::EPSILON < self.live_plot_origin_seconds
+                    if self.chart_observation_mode == ChartObservationMode::Detail
+                        || point.time_seconds + f64::EPSILON < self.live_plot_origin_seconds
                         || point.time_seconds >= detailed_start
                     {
                         continue;
@@ -5426,7 +5484,7 @@ impl PowerMonitorApp {
         // Keep the measurement rail invariant across locales.  A fixed rail
         // prevents English labels from changing the chart origin and makes
         // screenshots and cursor alignment comparable in both languages.
-        let rail_width = 272.0;
+        let rail_width = if compact { 224.0 } else { 240.0 };
         egui::Panel::left("instrument_rail")
             .resizable(false)
             .exact_size(rail_width)
@@ -5677,7 +5735,8 @@ impl PowerMonitorApp {
     }
 
     fn show_instrument_rail(&mut self, ui: &mut egui::Ui, compact: bool) {
-        ui.spacing_mut().item_spacing.y = if compact { 2.0 } else { 4.0 };
+        ui.spacing_mut().item_spacing = egui::vec2(6.0, 2.0);
+        let section_gap = if compact { 6.0 } else { 8.0 };
         let language = self.language;
         let current = self.displayed_current_readout();
         let readout_available = self.instrument_readout_available();
@@ -5692,11 +5751,10 @@ impl PowerMonitorApp {
                 color: theme::VOLTAGE,
                 statistics: statistics.voltage.readout(),
                 compact,
-                language,
                 readout_status,
             },
         );
-        ui.add_space(if compact { 4.0 } else { 12.0 });
+        ui.add_space(section_gap);
         instrument_card(
             ui,
             InstrumentCardData {
@@ -5706,11 +5764,10 @@ impl PowerMonitorApp {
                 color: theme::CURRENT,
                 statistics: statistics.current.readout(),
                 compact,
-                language,
                 readout_status,
             },
         );
-        ui.add_space(if compact { 4.0 } else { 12.0 });
+        ui.add_space(section_gap);
         instrument_card(
             ui,
             InstrumentCardData {
@@ -5720,12 +5777,11 @@ impl PowerMonitorApp {
                 color: theme::POWER,
                 statistics: statistics.power.readout(),
                 compact,
-                language,
                 readout_status,
             },
         );
 
-        ui.add_space(if compact { 4.0 } else { 12.0 });
+        ui.add_space(section_gap);
         let accumulated = if self.plot_source == PlotSource::Live {
             AccumulatedReadout {
                 cumulative_energy_uwh: self.displayed_cumulative_energy_uwh(),
@@ -5772,49 +5828,73 @@ impl PowerMonitorApp {
             .corner_radius(egui::CornerRadius::same(6))
             .inner_margin(egui::Margin::symmetric(10, if compact { 6 } else { 8 }))
             .show(ui, |ui| {
-                ui.set_min_width((accumulated_width - 20.0).max(120.0));
+                let content_width = (accumulated_width - 22.0).max(0.0);
+                ui.set_width(content_width);
+                ui.set_max_width(content_width);
                 ui.horizontal(|ui| {
-                    let duration_width = 94.0;
-                    let title_width = (ui.available_width() - duration_width - 4.0).max(76.0);
+                    let duration_width = 78.0;
+                    let title_width = (content_width - duration_width - 6.0).max(0.0);
                     ui.allocate_ui_with_layout(
-                        egui::vec2(title_width, 20.0),
+                        egui::vec2(title_width, 18.0),
                         egui::Layout::left_to_right(egui::Align::Center),
                         |ui| {
                             ui.add(
                                 egui::Label::new(
-                                    egui::RichText::new(language.pick("录制累计", "Session totals"))
+                                    egui::RichText::new(language.pick("会话累计", "Session totals"))
                                         .strong()
-                                        .size(16.0),
+                                        .size(14.0),
                                 )
                                 .truncate(),
                             );
                         },
                     );
                     ui.allocate_ui_with_layout(
-                        egui::vec2(duration_width, 20.0),
+                        egui::vec2(duration_width, 18.0),
                         egui::Layout::right_to_left(egui::Align::Center),
                         |ui| {
-                            ui.monospace(&duration_text);
+                            ui.add(
+                                egui::Label::new(egui::RichText::new(&duration_text).monospace().size(11.0)).truncate(),
+                            )
+                            .on_hover_text(&duration_text);
                         },
                     );
                 });
-                egui::Grid::new("recording_accumulated_grid")
-                    .num_columns(2)
-                    .spacing([8.0, if compact { 2.0 } else { 4.0 }])
-                    .show(ui, |ui| {
-                        ui.colored_label(theme::POWER, language.pick("累计能量", "Energy"));
-                        ui.monospace(&cumulative_energy_text);
-                        ui.end_row();
-                        ui.colored_label(theme::CURRENT, language.pick("累计容量", "Capacity"));
-                        ui.monospace(&capacity_text);
-                        ui.end_row();
-                        ui.colored_label(theme::POWER, language.pick("净能量", "Net energy"));
-                        ui.monospace(&net_energy_text);
-                        ui.end_row();
+                for (label, value, color) in [
+                    (
+                        language.pick("累计能量", "Energy"),
+                        &cumulative_energy_text,
+                        theme::ENERGY,
+                    ),
+                    (language.pick("累计容量", "Capacity"), &capacity_text, theme::CAPACITY),
+                    (
+                        language.pick("净能量", "Net energy"),
+                        &net_energy_text,
+                        theme::text_secondary(),
+                    ),
+                ] {
+                    ui.horizontal(|ui| {
+                        let label_width = 70.0;
+                        let value_width = (content_width - label_width - 6.0).max(0.0);
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(label_width, 20.0),
+                            egui::Layout::left_to_right(egui::Align::Center),
+                            |ui| {
+                                ui.add(egui::Label::new(egui::RichText::new(label).color(color)).truncate());
+                            },
+                        );
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(value_width, 20.0),
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                ui.add(egui::Label::new(egui::RichText::new(value).monospace()).truncate())
+                                    .on_hover_text(value);
+                            },
+                        );
                     });
+                }
             });
 
-        ui.add_space(if compact { 4.0 } else { 12.0 });
+        ui.add_space(section_gap);
         let [dp, dm, cc1, cc2] = self.source_signal_values();
         let protocol_state = self.displayed_protocol_state();
         let protocol_summary = match protocol_state {
@@ -5848,66 +5928,46 @@ impl PowerMonitorApp {
             .fill(theme::panel_raised())
             .stroke(egui::Stroke::new(1.0, theme::divider()))
             .corner_radius(egui::CornerRadius::same(6))
-            .inner_margin(egui::Margin::symmetric(9, if compact { 5 } else { 7 }))
+            .inner_margin(egui::Margin::symmetric(10, 7))
             .show(ui, |ui| {
-                ui.set_min_width((protocol_width - 18.0).max(120.0));
-                if compact {
-                    ui.label(
-                        egui::RichText::new(language.pick("当前协议", "Active protocol"))
-                            .strong()
-                            .size(16.0),
-                    );
-                } else {
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            egui::RichText::new(language.pick("当前协议", "Active protocol"))
-                                .strong()
-                                .size(16.0),
-                        );
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.label(
-                                egui::RichText::new(protocol_state.localized_status_label(language))
-                                    .small()
-                                    .strong()
-                                    .color(theme::text_secondary()),
+                let content_width = (protocol_width - 22.0).max(0.0);
+                ui.set_width(content_width);
+                ui.set_max_width(content_width);
+                ui.set_min_height(48.0);
+                ui.horizontal(|ui| {
+                    let status_width = 100.0;
+                    let title_width = (content_width - status_width - 6.0).max(0.0);
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(title_width, 18.0),
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        |ui| {
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(language.pick("协议", "Protocol"))
+                                        .strong()
+                                        .size(14.0),
+                                )
+                                .truncate(),
                             );
-                        });
-                    });
-                }
-                if compact {
-                    ui.add(
-                        egui::Label::new(
-                            egui::RichText::new(protocol_state.localized_status_label(language))
-                                .small()
-                                .strong()
-                                .color(theme::text_secondary()),
-                        )
-                        .truncate(),
+                        },
                     );
-                }
-                ui.add(
-                    egui::Label::new(
-                        egui::RichText::new(&protocol_summary)
-                            .monospace()
-                            .small()
-                            .color(theme::text_primary()),
-                    )
-                    .truncate(),
-                )
-                .on_hover_text(&protocol_summary);
-                if !compact && matches!(protocol_state, PowerProtocolState::TraditionalUnconfirmed) {
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "VBUS {:.2} V · D+ {} · D− {}",
-                            current.voltage,
-                            dp.map_or_else(|| "—".to_string(), |value| format!("{value:.2} V")),
-                            dm.map_or_else(|| "—".to_string(), |value| format!("{value:.2} V")),
-                        ))
-                        .monospace()
-                        .small()
-                        .color(theme::muted_text()),
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(status_width, 18.0),
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(protocol_state.localized_status_label(language))
+                                        .size(11.0)
+                                        .color(theme::text_secondary()),
+                                )
+                                .truncate(),
+                            )
+                            .on_hover_text(protocol_state.localized_status_label(language));
+                        },
                     );
-                }
+                });
+                settings_text(ui, &protocol_summary, content_width, theme::text_primary());
             });
         if protocol_card
             .response
@@ -5921,42 +5981,31 @@ impl PowerMonitorApp {
             self.active_tab = WorkspaceTab::PdAnalysis;
         }
 
-        ui.add_space(if compact { 4.0 } else { 12.0 });
+        ui.add_space(section_gap);
         let signal_width = ui.available_width();
         egui::Frame::NONE
             .fill(theme::panel())
             .stroke(egui::Stroke::new(1.0, theme::divider()))
             .corner_radius(egui::CornerRadius::same(6))
-            .inner_margin(egui::Margin::symmetric(9, if compact { 5 } else { 7 }))
+            .inner_margin(egui::Margin::symmetric(10, 6))
             .show(ui, |ui| {
-                ui.set_min_width((signal_width - 18.0).max(120.0));
-                if compact {
-                    let chip_width = ((ui.available_width() - 18.0) / 4.0).max(48.0);
-                    ui.horizontal(|ui| {
-                        compact_signal_value(ui, "D+", dp, chip_width, language);
-                        compact_signal_value(ui, "D−", dm, chip_width, language);
-                        compact_signal_value(ui, "CC1", cc1, chip_width, language);
-                        compact_signal_value(ui, "CC2", cc2, chip_width, language);
-                    });
-                } else {
-                    ui.label(
-                        egui::RichText::new(language.pick("信号线", "Signal lines"))
-                            .strong()
-                            .size(16.0),
-                    );
-                    egui::Grid::new("signal_grid")
-                        .num_columns(2)
-                        .spacing([18.0, 4.0])
-                        .show(ui, |ui| {
-                            let signal_chip_width = ((ui.available_width() - 18.0) / 2.0).max(72.0);
-                            signal_value(ui, "D+", dp, signal_chip_width, language);
-                            signal_value(ui, "D−", dm, signal_chip_width, language);
-                            ui.end_row();
-                            signal_value(ui, "CC1", cc1, signal_chip_width, language);
-                            signal_value(ui, "CC2", cc2, signal_chip_width, language);
-                            ui.end_row();
-                        });
-                }
+                let content_width = (signal_width - 22.0).max(0.0);
+                ui.set_width(content_width);
+                ui.set_max_width(content_width);
+                ui.spacing_mut().interact_size.y = 18.0;
+                ui.label(
+                    egui::RichText::new(language.pick("信号线 · V", "Signal lines · V"))
+                        .color(theme::text_secondary())
+                        .size(11.0),
+                );
+                let chip_width = ((content_width - 8.0) / 2.0).max(0.0);
+                ui.spacing_mut().item_spacing.x = 8.0;
+                ui.columns(2, |columns| {
+                    compact_signal_value(&mut columns[0], "D+", dp, chip_width, language);
+                    compact_signal_value(&mut columns[0], "CC1", cc1, chip_width, language);
+                    compact_signal_value(&mut columns[1], "D−", dm, chip_width, language);
+                    compact_signal_value(&mut columns[1], "CC2", cc2, chip_width, language);
+                });
             });
     }
 }
@@ -6142,7 +6191,6 @@ struct InstrumentCardData<'a> {
     color: egui::Color32,
     statistics: Option<MetricStatistics>,
     compact: bool,
-    language: Language,
     readout_status: &'a str,
 }
 
@@ -6154,7 +6202,6 @@ fn instrument_card(ui: &mut egui::Ui, data: InstrumentCardData<'_>) {
         color,
         statistics,
         compact,
-        language,
         readout_status,
     } = data;
     let card_width = ui.available_width();
@@ -6172,177 +6219,71 @@ fn instrument_card(ui: &mut egui::Ui, data: InstrumentCardData<'_>) {
         MeasurementUnit::Current => "IBUS",
         MeasurementUnit::Power => "PWR",
     };
-    let card = egui::Frame::NONE
-        .fill(theme::panel_raised())
-        .stroke(egui::Stroke::new(1.0, theme::divider()))
-        .corner_radius(egui::CornerRadius::same(6))
-        .inner_margin(egui::Margin::symmetric(
-            if compact { 12 } else { 16 },
-            if compact { 4 } else { 10 },
-        ))
-        .show(ui, |ui| {
-            ui.spacing_mut().item_spacing.y = 2.0;
-            ui.set_width((card_width - if compact { 26.0 } else { 34.0 }).max(120.0));
-            ui.set_min_height(if compact { 78.0 } else { 96.0 });
-            ui.horizontal(|ui| {
-                let status_width = 58.0;
-                let label_width = (ui.available_width() - status_width - 4.0).max(72.0);
-                ui.allocate_ui_with_layout(
-                    egui::vec2(label_width, 20.0),
-                    egui::Layout::left_to_right(egui::Align::Center),
-                    |ui| {
-                        ui.add(
-                            egui::Label::new(
-                                egui::RichText::new(format!("{label}  {channel}"))
-                                    .color(theme::text_primary())
-                                    .strong()
-                                    .size(16.0),
-                            )
-                            .truncate(),
-                        );
-                    },
-                );
-                ui.allocate_ui_with_layout(
-                    egui::vec2(status_width, 20.0),
-                    egui::Layout::right_to_left(egui::Align::Center),
-                    |ui| {
-                        ui.label(
-                            egui::RichText::new(readout_status)
-                                .small()
-                                .color(theme::text_secondary()),
-                        );
-                    },
-                );
-            });
-            ui.add_space(if compact { 0.0 } else { 2.0 });
-            ui.horizontal(|ui| {
-                let unit_width = 38.0;
-                let value_width = (ui.available_width() - unit_width - 4.0).max(48.0);
-                ui.allocate_ui_with_layout(
-                    egui::vec2(value_width, if compact { 29.0 } else { 36.0 }),
-                    egui::Layout::right_to_left(egui::Align::Center),
-                    |ui| {
-                        ui.label(
-                            egui::RichText::new(
-                                value.map_or_else(|| "—".to_string(), |value| presentation.format_value(value)),
-                            )
-                            .monospace()
-                            .size(if compact { 30.0 } else { 34.0 })
-                            .strong()
-                            .color(color),
-                        );
-                    },
-                );
-                ui.allocate_ui_with_layout(
-                    egui::vec2(unit_width, if compact { 29.0 } else { 36.0 }),
-                    egui::Layout::right_to_left(egui::Align::Center),
-                    |ui| {
-                        ui.label(
-                            egui::RichText::new(presentation.symbol)
-                                .monospace()
-                                .size(14.0)
-                                .strong()
-                                .color(color),
-                        );
-                    },
-                );
-            });
-            egui::Frame::NONE
-                .fill(theme::panel())
-                .corner_radius(egui::CornerRadius::same(5))
-                .inner_margin(egui::Margin::symmetric(7, if compact { 2 } else { 3 }))
-                .show(ui, |ui| {
-                    if let Some(statistics) = statistics {
-                        let values = [
-                            presentation.format_value(statistics.minimum),
-                            presentation.format_value(statistics.average),
-                            presentation.format_value(statistics.maximum),
-                        ];
-                        ui.columns(3, |columns| {
-                            for (index, heading) in [
-                                language.pick("最小", if compact { "Min" } else { "Minimum" }),
-                                language.pick("平均", if compact { "Avg" } else { "Average" }),
-                                language.pick("最大", if compact { "Max" } else { "Maximum" }),
-                            ]
-                            .into_iter()
-                            .enumerate()
-                            {
-                                columns[index].vertical_centered(|ui| {
-                                    ui.spacing_mut().item_spacing.y = 0.0;
-                                    ui.label(egui::RichText::new(heading).small().color(theme::text_muted()));
-                                    ui.label(
-                                        egui::RichText::new(&values[index])
-                                            .monospace()
-                                            .small()
-                                            .color(theme::text_primary()),
-                                    );
-                                });
-                            }
-                        });
-                    } else {
-                        ui.vertical_centered(|ui| {
-                            ui.set_min_height(if compact { 28.0 } else { 34.0 });
-                            ui.label(
-                                egui::RichText::new(language.pick(
-                                    "最小 · 平均 · 最大",
-                                    if compact {
-                                        "Min · Avg · Max"
-                                    } else {
-                                        "Minimum · Average · Maximum"
-                                    },
-                                ))
-                                .small()
-                                .color(theme::text_muted()),
-                            );
-                            ui.label(
-                                egui::RichText::new(
-                                    language.pick("记录后显示统计", "Statistics appear after recording"),
-                                )
-                                .small()
-                                .color(theme::text_muted().gamma_multiply(0.72)),
-                            );
-                        });
-                    }
-                });
-        });
-    let stripe_rect = egui::Rect::from_min_max(
-        egui::pos2(card.response.rect.left() + 1.0, card.response.rect.top() + 8.0),
-        egui::pos2(card.response.rect.left() + 4.0, card.response.rect.bottom() - 8.0),
+    // Readouts own a fixed rectangle. Statistics belong to the selected chart
+    // interval, so neither a recorded peak nor a locale change moves this row.
+    let (card_rect, _) = ui.allocate_exact_size(
+        egui::vec2(card_width, if compact { 78.0 } else { 94.0 }),
+        egui::Sense::hover(),
     );
-    ui.painter().rect_filled(stripe_rect, 2.0, color);
-}
-
-fn signal_value(ui: &mut egui::Ui, label: &str, value: Option<f64>, width: f32, language: Language) {
-    let response = egui::Frame::NONE
-        .fill(theme::panel_raised())
-        .stroke(egui::Stroke::new(1.0, theme::divider().gamma_multiply(0.7)))
-        .corner_radius(egui::CornerRadius::same(6))
-        .inner_margin(egui::Margin::symmetric(8, 4))
-        .show(ui, |ui| {
-            ui.set_width((width - 16.0).max(48.0));
-            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                ui.label(egui::RichText::new(label).strong().color(theme::text_secondary()));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(
-                        egui::RichText::new(value.map_or_else(|| "—".to_string(), |value| format!("{value:.2} V")))
-                            .monospace()
-                            .color(theme::text_primary()),
-                    );
-                });
-            });
-        });
-    let explanation = match label {
-        "D+" | "D−" => language.pick(
-            "USB 2.0 数据线电压，也可用于部分传统充电识别协议。",
-            "USB 2.0 data-line voltage, also used by some legacy charging-detection protocols.",
-        ),
-        "CC1" | "CC2" => language.pick(
-            "USB-C 配置通道：用于方向、角色、电流能力与 USB PD 协商。",
-            "USB-C Configuration Channel used for orientation, roles, current advertisement, and USB PD negotiation.",
-        ),
-        _ => language.pick("KM003C 实时信号线电压。", "Live KM003C signal-line voltage."),
-    };
-    response.response.on_hover_text(explanation);
+    let painter = ui.painter().with_clip_rect(card_rect.intersect(ui.clip_rect()));
+    painter.rect_filled(card_rect, 6, theme::panel_raised());
+    painter.rect_stroke(
+        card_rect,
+        6,
+        egui::Stroke::new(1.0, theme::divider()),
+        egui::StrokeKind::Inside,
+    );
+    let header_top = card_rect.top() + 7.0;
+    let status_width = 52.0;
+    let title_rect = egui::Rect::from_min_max(
+        egui::pos2(card_rect.left() + 12.0, header_top),
+        egui::pos2(card_rect.right() - status_width - 16.0, header_top + 20.0),
+    );
+    // Render the header in an independent child. `Ui::put` advances the
+    // parent to its small header rectangle and would erase the card's reserved
+    // height, causing the next readout to cover the numeric row.
+    let mut header_ui = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(title_rect)
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+    );
+    header_ui.add(
+        egui::Label::new(
+            egui::RichText::new(format!("{label}  {channel}"))
+                .color(theme::text_primary())
+                .size(14.0)
+                .strong(),
+        )
+        .truncate(),
+    );
+    painter.text(
+        egui::pos2(card_rect.right() - 10.0, header_top + 10.0),
+        egui::Align2::RIGHT_CENTER,
+        readout_status,
+        egui::FontId::proportional(11.0),
+        theme::text_secondary(),
+    );
+    let value_text = value.map_or_else(|| "—".to_string(), |value| presentation.format_value(value));
+    let baseline = card_rect.bottom() - if compact { 10.0 } else { 14.0 };
+    painter.text(
+        egui::pos2(card_rect.right() - 38.0, baseline),
+        egui::Align2::RIGHT_BOTTOM,
+        value_text,
+        egui::FontId::monospace(if compact { 32.0 } else { 34.0 }),
+        color,
+    );
+    painter.text(
+        egui::pos2(card_rect.right() - 30.0, baseline - 3.0),
+        egui::Align2::LEFT_BOTTOM,
+        presentation.symbol,
+        egui::FontId::monospace(14.0),
+        color,
+    );
+    let stripe_rect = egui::Rect::from_min_max(
+        egui::pos2(card_rect.left() + 1.0, card_rect.top() + 8.0),
+        egui::pos2(card_rect.left() + 4.0, card_rect.bottom() - 8.0),
+    );
+    painter.rect_filled(stripe_rect, 2.0, color);
 }
 
 fn compact_signal_value(ui: &mut egui::Ui, label: &str, value: Option<f64>, width: f32, language: Language) {
@@ -6438,21 +6379,222 @@ impl PowerMonitorApp {
         }
     }
 
+    fn show_chart_follow_controls(&mut self, ui: &mut egui::Ui, compact: bool) {
+        let language = self.language;
+        let pin_label = if self.cursor_pinned {
+            if compact {
+                language.pick("取消固定", "Unpin")
+            } else {
+                language.pick("取消固定游标", "Unpin cursor")
+            }
+        } else if compact {
+            language.pick("固定", "Pin")
+        } else {
+            language.pick("固定游标", "Pin cursor")
+        };
+        if ui
+            .add_enabled_ui(self.cursor_readout.is_some(), |ui| {
+                ui.add_sized(
+                    [if compact { 80.0 } else { 104.0 }, 28.0],
+                    egui::Button::new(pin_label).selected(self.cursor_pinned),
+                )
+            })
+            .inner
+            .clicked()
+        {
+            self.cursor_pinned = !self.cursor_pinned;
+        }
+        let range_label = match self.chart_follow_mode {
+            ChartFollowMode::FullSession => language.pick("全程", "Full session").to_string(),
+            ChartFollowMode::LatestWindow => format!(
+                "{} {}",
+                language.pick("最近", "Latest"),
+                self.time_window.localized_label(language)
+            ),
+            ChartFollowMode::Manual => language.pick("手动窗口", "Manual window").to_string(),
+        };
+        egui::ComboBox::from_id_salt("monitor_range_mode")
+            .width(if compact { 96.0 } else { 132.0 })
+            .truncate()
+            .selected_text(&range_label)
+            .show_ui(ui, |ui| {
+                if ui.selectable_label(
+                    self.chart_follow_mode == ChartFollowMode::FullSession,
+                    language.pick("全程 · 0 到最新", "Full session · 0 to latest"),
+                ).clicked() {
+                    self.time_window = TimeWindow::All;
+                    self.chart_follow_mode = ChartFollowMode::FullSession;
+                    self.chart_viewport.selection = None;
+                }
+                for window in TimeWindow::all().iter().copied().filter(|window| *window != TimeWindow::All) {
+                    if ui.selectable_label(
+                        self.chart_follow_mode == ChartFollowMode::LatestWindow && self.time_window == window,
+                        format!("{} {}", language.pick("跟随最近", "Follow latest"), window.localized_label(language)),
+                    ).clicked() {
+                        self.time_window = window;
+                        self.chart_follow_mode = ChartFollowMode::LatestWindow;
+                        self.chart_viewport.selection = None;
+                    }
+                }
+                ui.add_enabled_ui(self.chart_follow_mode == ChartFollowMode::Manual, |ui| {
+                    let _ = ui.selectable_label(true, language.pick("手动窗口 · 拖动中", "Manual window · Dragging"));
+                });
+            })
+            .response
+            .on_hover_text(format!("{range_label}\n{}", language.pick(
+                "全程会从 00:00:00.0 展开；最近窗口会保持指定宽度；拖动或缩放后进入手动窗口",
+                "Full session grows from 00:00:00.0. Latest keeps a fixed-width window. Drag or zoom to enter manual view.",
+            )));
+        if self.chart_follow_mode == ChartFollowMode::Manual
+            && ui
+                .button(if compact {
+                    language.pick("最新", "Latest")
+                } else {
+                    language.pick("回到最新", "Back to latest")
+                })
+                .clicked()
+        {
+            if self.time_window == TimeWindow::All {
+                self.time_window = TimeWindow::Sec30;
+            }
+            self.chart_follow_mode = ChartFollowMode::LatestWindow;
+            self.chart_viewport.selection = None;
+        }
+    }
+
+    fn show_chart_observation_controls(&mut self, ui: &mut egui::Ui) {
+        let language = self.language;
+        ui.horizontal(|ui| {
+            for (mode, name) in [
+                (ChartObservationMode::Overview, language.pick("全程趋势", "Overview")),
+                (ChartObservationMode::Detail, language.pick("细节检查", "Detail")),
+            ] {
+                let selected = self.chart_observation_mode == mode;
+                let button = egui::Button::new(name).selected(selected)
+                    .fill(if selected { theme::panel_raised() } else { theme::panel() })
+                    .stroke(egui::Stroke::new(if selected { 1.5 } else { 1.0 }, if selected { theme::text_secondary() } else { theme::divider() }));
+                if ui.add_sized([104.0, 28.0], button).clicked() {
+                    self.chart_observation_mode = mode;
+                }
+            }
+            ui.separator();
+            let mut trend = self.display_filter == DisplayFilter::Median5;
+            if ui.checkbox(&mut trend, language.pick("叠加趋势", "Trend overlay"))
+                .on_hover_text(language.pick("五点中值趋势；始终保留原始曲线，不改变统计或导出。", "Five-sample median trend. Raw traces remain visible; statistics and exports are unchanged."))
+                .changed() {
+                self.display_filter = if trend { DisplayFilter::Median5 } else { DisplayFilter::Raw };
+            }
+            ui.label(egui::RichText::new(language.pick("原始峰值保留", "Raw peaks retained")).size(11.0).color(theme::text_muted()))
+                .on_hover_text(language.pick(
+                    "曲线抽稀保留每个显示分桶的最小和最大值；趋势线不会替换原始曲线。旧的聚合区间会单独标识。",
+                    "Display decimation preserves bucket minima and maxima. The trend never replaces raw traces. Older aggregated intervals are identified separately.",
+                ));
+        });
+        if self.chart_observation_mode == ChartObservationMode::Detail {
+            ui.horizontal(|ui| {
+                for (index, label) in [
+                    language.pick("电压", "Voltage"),
+                    language.pick("|I| 电流", "|I| Current"),
+                    language.pick("|P| 功率", "|P| Power"),
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    if ui
+                        .add_sized(
+                            [92.0, 26.0],
+                            egui::Button::new(label)
+                                .selected(self.detail_channel == index)
+                                .fill(if self.detail_channel == index {
+                                    theme::panel_raised()
+                                } else {
+                                    theme::panel()
+                                })
+                                .stroke(egui::Stroke::new(
+                                    1.0,
+                                    if self.detail_channel == index {
+                                        [theme::VOLTAGE, theme::CURRENT, theme::POWER][index]
+                                    } else {
+                                        theme::divider()
+                                    },
+                                )),
+                        )
+                        .clicked()
+                        && self.detail_channel != index
+                    {
+                        self.detail_channel = index;
+                        self.detail_locked_range = None;
+                    }
+                }
+                ui.separator();
+                let label = match self.detail_range_mode {
+                    RangeMode::Local => language.pick("局部量程", "Local range"),
+                    RangeMode::FromZero => language.pick("从零量程", "From zero"),
+                    RangeMode::Locked => language.pick("锁定量程", "Locked range"),
+                };
+                egui::ComboBox::from_id_salt("detail_y_range")
+                    .width(120.0)
+                    .selected_text(label)
+                    .show_ui(ui, |ui| {
+                        for (mode, label) in [
+                            (
+                                RangeMode::Local,
+                                language.pick("局部量程 · 保留真实基线", "Local · True baseline"),
+                            ),
+                            (RangeMode::FromZero, language.pick("从零量程", "From zero")),
+                            (RangeMode::Locked, language.pick("锁定当前量程", "Lock current range")),
+                        ] {
+                            if ui.selectable_label(self.detail_range_mode == mode, label).clicked() {
+                                self.detail_range_mode = mode;
+                                if mode != RangeMode::Locked {
+                                    self.detail_locked_range = None;
+                                }
+                            }
+                        }
+                    });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    self.show_chart_follow_controls(ui, true);
+                });
+            });
+        }
+        ui.add_space(4.0);
+    }
+
+    fn monitor_trace_ranges(&mut self, raw: &[Vec<[f64; 2]>; 3]) -> [TraceRange; 3] {
+        let mut ranges = std::array::from_fn(|index| TraceRange::from_zero(&raw[index]));
+        if self.chart_observation_mode == ChartObservationMode::Detail {
+            let index = self.detail_channel;
+            // Presentation floors only: these are not claims of device accuracy.
+            let floor = [0.001, 0.000001, 0.00001][index];
+            let local = TraceRange::local(&raw[index], floor);
+            ranges[index] = match self.detail_range_mode {
+                RangeMode::Local => local,
+                RangeMode::FromZero => ranges[index],
+                RangeMode::Locked => {
+                    let (_, locked) = *self.detail_locked_range.get_or_insert((index, local));
+                    locked
+                }
+            };
+            if self.detail_range_mode != RangeMode::Locked {
+                self.detail_locked_range = Some((index, ranges[index]));
+            }
+        }
+        ranges
+    }
+
     fn show_combined_monitor_chart(&mut self, ui: &mut egui::Ui, compact: bool) {
         let language = self.language;
+        self.show_chart_observation_controls(ui);
         let selection = self.ensure_chart_selection();
-        let navigator_height = if compact { 62.0 } else { 76.0 };
+        let navigator_height = if compact { 48.0 } else { 56.0 };
         let workspace_bottom = ui.max_rect().bottom();
         let max_plot_points = (ui.available_width().max(320.0) * 2.0) as usize;
-        let vip_points = self.source_vip_points(selection, max_plot_points, self.display_filter);
+        let vip_points = self.source_vip_points(selection, max_plot_points, DisplayFilter::Raw);
         let accumulated_points = self.source_accumulated_points(selection, max_plot_points);
-        let raw_vip_points = (self.display_filter != DisplayFilter::Raw)
-            .then(|| self.source_vip_points(selection, max_plot_points / 2, DisplayFilter::Raw));
-        let scales = [
-            AxisScale::from_visible_max(vip_points[0].iter().map(|point| point[1]).fold(0.0_f64, f64::max)),
-            AxisScale::from_visible_max(vip_points[1].iter().map(|point| point[1]).fold(0.0_f64, f64::max)),
-            AxisScale::from_visible_max(vip_points[2].iter().map(|point| point[1]).fold(0.0_f64, f64::max)),
-        ];
+        let trend_vip_points = (self.display_filter != DisplayFilter::Raw)
+            .then(|| self.source_vip_points(selection, max_plot_points, DisplayFilter::Median5));
+        let scales = self.monitor_trace_ranges(&vip_points);
+        let detail = self.chart_observation_mode == ChartObservationMode::Detail;
         let accumulated_scales = [
             AxisScale::from_visible_max(
                 accumulated_points[0]
@@ -6471,13 +6613,14 @@ impl PowerMonitorApp {
             CumulativePresentation::for_maximum(accumulated_scales[0].maximum, CumulativeUnit::Energy),
             CumulativePresentation::for_maximum(accumulated_scales[1].maximum, CumulativeUnit::Capacity),
         ];
-        let cumulative_track_visible = self.visible_accumulated_series.iter().any(|visible| *visible);
+        let cumulative_track_visible = !detail && self.visible_accumulated_series.iter().any(|visible| *visible);
         let cumulative_track_height = if cumulative_track_visible {
             if compact { 88.0 } else { 112.0 }
         } else {
             0.0
         };
-        let show_chart_art = self.skin_art_available() && ui.available_width() >= if compact { 760.0 } else { 820.0 };
+        // Wallpaper remains outside the opaque plotting surface. No extra
+        // character block consumes chart height or competes with measurements.
 
         egui::Frame::NONE
             .fill(theme::panel())
@@ -6485,162 +6628,56 @@ impl PowerMonitorApp {
             .corner_radius(egui::CornerRadius::same(8))
             .inner_margin(egui::Margin::symmetric(10, 8))
             .show(ui, |ui| {
+                let background = theme::backplane();
+                ui.visuals_mut().extreme_bg_color = egui::Color32::from_rgb(background.r(), background.g(), background.b());
                 self.show_imported_recording_banner(ui, compact);
-                ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new(language.pick("V / A / W 测量曲线", "V / A / W measurements"))
-                            .strong()
-                            .size(16.0),
-                    );
-                    if !compact {
-                        ui.add(
-                            egui::Label::new(
-                                egui::RichText::new(self.source_label()).small().color(theme::muted_text()),
-                            )
-                            .truncate(),
+                let raw_boundary = self.raw_cache_boundary(selection);
+                if let Some(start) = raw_boundary {
+                    ui.label(egui::RichText::new(format!(
+                        "{} {}",
+                        language.pick("早期区间为概览；原始细节从", "Earlier interval is aggregated; raw detail starts at"),
+                        format_plot_time(start)
+                    )).size(11.0).color(theme::text_secondary())).on_hover_text(language.pick(
+                        "早期原始采样已离开详细缓存。细节视图不把概览桶伪装成原始采样；导入已保存的文件可以检查完整原始数据。下方细节统计仅计算仍在缓存内的原始样本。",
+                        "Earlier raw samples have left the detail cache. Detail view does not treat overview buckets as raw samples. Import the saved file for its full raw data. Detail statistics only cover retained raw samples.",
+                    ));
+                }
+                if detail && self.detail_range_mode == RangeMode::Locked {
+                    let channel = self.detail_channel;
+                    let outside: Vec<_> = vip_points[channel].iter().filter(|point| !scales[channel].contains(point[1])).collect();
+                    if !outside.is_empty() {
+                        let minimum = outside.iter().map(|point| point[1]).fold(f64::INFINITY, f64::min);
+                        let maximum = outside.iter().map(|point| point[1]).fold(f64::NEG_INFINITY, f64::max);
+                        let unit = [MeasurementUnit::Voltage, MeasurementUnit::Current, MeasurementUnit::Power][channel];
+                        let presentation = EngineeringPresentation::for_range(scales[channel], unit);
+                        ui.label(egui::RichText::new(format!("{} {}–{} {}", language.pick("锁定量程外仍有数据：", "Values outside locked range:"), presentation.format_value(minimum), presentation.format_value(maximum), presentation.symbol)).size(11.0).color(theme::POWER));
+                    }
+                }
+
+                if !detail {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new(language.pick("V / A / W 测量曲线", "V / A / W measurements"))
+                                .strong()
+                                .size(16.0),
                         );
-                    }
-
-                    if matches!(
-                        self.recording_phase,
-                        RecordingPhase::Recording
-                            | RecordingPhase::Paused
-                            | RecordingPhase::Interrupted
-                            | RecordingPhase::WaitingForReconnect
-                            | RecordingPhase::Recovering
-                    ) {
-                        let (color, text) = match self.recording_phase {
-                            RecordingPhase::Paused => (
-                                theme::text_secondary(),
-                                if compact {
-                                    language.pick("Ⅱ 录制暂停", "Ⅱ Paused")
-                                } else {
-                                    language.pick(
-                                        "Ⅱ 录制已暂停 · 设备仍在采样",
-                                        "Ⅱ Recording paused · Device still sampling",
-                                    )
-                                },
-                            ),
-                            RecordingPhase::WaitingForReconnect => (
-                                theme::POWER,
-                                language.pick("USB 中断 · 等待重连", "USB interrupted · Waiting to reconnect"),
-                            ),
-                            RecordingPhase::Recovering => (
-                                theme::POWER,
-                                language.pick("正在恢复续录", "Restoring recording"),
-                            ),
-                            RecordingPhase::Interrupted => (
-                                theme::RECORDING,
-                                language.pick("录制中断 · 可恢复", "Recording interrupted · Recoverable"),
-                            ),
-                            _ => (
-                                theme::RECORDING,
-                                if compact {
-                                    language.pick("● 录制中", "● Recording")
-                                } else {
-                                    language.pick("● 正在录制", "● Recording in progress")
-                                },
-                            ),
-                        };
-                        egui::Frame::NONE
-                            .fill(theme::panel_raised())
-                            .stroke(egui::Stroke::new(1.0, theme::divider()))
-                            .corner_radius(egui::CornerRadius::same(6))
-                            .inner_margin(egui::Margin::symmetric(7, 3))
-                            .show(ui, |ui| {
-                                ui.colored_label(color, egui::RichText::new(text).strong().small());
-                            });
-                    }
-
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if show_chart_art {
-                            self.show_skin_atmosphere(
-                                ui,
-                                if compact { 64.0 } else { 92.0 },
-                                if compact { 42.0 } else { 64.0 },
-                                175,
+                        if !compact {
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(self.source_label()).small().color(theme::muted_text()),
+                                )
+                                .truncate(),
                             );
-                            ui.add_space(8.0);
                         }
-                        let range_label = match self.chart_follow_mode {
-                            ChartFollowMode::FullSession => language.pick("全程", "Full session").to_string(),
-                            ChartFollowMode::LatestWindow => format!(
-                                "{} {}",
-                                language.pick("最近", "Latest"),
-                                self.time_window.localized_label(language)
-                            ),
-                            ChartFollowMode::Manual => language.pick("手动窗口", "Manual window").to_string(),
-                        };
-                        egui::ComboBox::from_id_salt("monitor_range_mode")
-                            .width(if compact { 96.0 } else { 132.0 })
-                            .selected_text(range_label)
-                            .show_ui(ui, |ui| {
-                                if ui
-                                    .selectable_label(
-                                        self.chart_follow_mode == ChartFollowMode::FullSession,
-                                        language.pick("全程 · 0 到最新", "Full session · 0 to latest"),
-                                    )
-                                    .clicked()
-                                {
-                                    self.time_window = TimeWindow::All;
-                                    self.chart_follow_mode = ChartFollowMode::FullSession;
-                                    self.chart_viewport.selection = None;
-                                }
-                                for window in TimeWindow::all()
-                                    .iter()
-                                    .copied()
-                                    .filter(|window| *window != TimeWindow::All)
-                                {
-                                    if ui
-                                        .selectable_label(
-                                            self.chart_follow_mode == ChartFollowMode::LatestWindow
-                                                && self.time_window == window,
-                                            format!(
-                                                "{} {}",
-                                                language.pick("跟随最近", "Follow latest"),
-                                                window.localized_label(language)
-                                            ),
-                                        )
-                                        .clicked()
-                                    {
-                                        self.time_window = window;
-                                        self.chart_follow_mode = ChartFollowMode::LatestWindow;
-                                        self.chart_viewport.selection = None;
-                                    }
-                                }
-                                ui.add_enabled_ui(self.chart_follow_mode == ChartFollowMode::Manual, |ui| {
-                                    let _ = ui.selectable_label(
-                                        true,
-                                        language.pick("手动窗口 · 拖动中", "Manual window · Dragging"),
-                                    );
-                                });
-                            })
-                            .response
-                            .on_hover_text(
-                                language.pick(
-                                    "全程会从 00:00:00.0 展开；最近窗口会保持指定宽度；拖动或缩放后进入手动窗口",
-                                    "Full session grows from 00:00:00.0. Latest keeps a fixed-width window. Drag or zoom to enter manual view.",
-                                ),
-                            );
-                        if self.chart_follow_mode == ChartFollowMode::Manual
-                            && ui
-                                .button(if compact {
-                                    language.pick("最新", "Latest")
-                                } else {
-                                    language.pick("回到最新", "Back to latest")
-                                })
-                                .clicked()
-                        {
-                            if self.time_window == TimeWindow::All {
-                                self.time_window = TimeWindow::Sec30;
-                            }
-                            self.chart_follow_mode = ChartFollowMode::LatestWindow;
-                            self.chart_viewport.selection = None;
-                        }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            self.show_chart_follow_controls(ui, compact);
+                        });
                     });
-                });
+                }
 
-                ui.horizontal(|ui| {
+                // Detail already has a channel selector and a real-unit axis.
+                // Do not repeat the same channel in a second legend row.
+                if !detail { ui.horizontal(|ui| {
                     for (series_index, (label, color, unit)) in [
                         (language.pick("电压", "Voltage"), theme::VOLTAGE, MeasurementUnit::Voltage),
                         (language.pick("电流", "Current"), theme::CURRENT, MeasurementUnit::Current),
@@ -6649,14 +6686,16 @@ impl PowerMonitorApp {
                     .into_iter()
                     .enumerate()
                     {
-                        let visible = self.visible_series[series_index];
-                        let presentation = scales[series_index].presentation(unit);
+                        if detail && series_index != self.detail_channel { continue; }
+                        let visible = if detail { self.detail_channel == series_index } else { self.visible_series[series_index] };
+                        let presentation = EngineeringPresentation::for_range(scales[series_index], unit);
                         let marker = if series_index == 2 { "┄" } else { "●" };
                         let text = if compact {
                             format!("{marker} {label}")
                         } else {
                             format!(
-                                "{marker} {label}  0–{} {}",
+                                "{marker} {label}  {}–{} {}",
+                                presentation.format_value(scales[series_index].minimum),
                                 presentation.format_value(scales[series_index].maximum),
                                 presentation.symbol
                             )
@@ -6679,9 +6718,14 @@ impl PowerMonitorApp {
                             })
                             .clicked()
                         {
-                            self.visible_series[series_index] = !visible;
-                            if !self.visible_series.iter().any(|visible| *visible) {
-                                self.visible_series[series_index] = true;
+                            if detail {
+                                self.detail_channel = series_index;
+                                self.detail_locked_range = None;
+                            } else {
+                                self.visible_series[series_index] = !visible;
+                                if !self.visible_series.iter().any(|visible| *visible) {
+                                    self.visible_series[series_index] = true;
+                                }
                             }
                         }
                     }
@@ -6702,6 +6746,7 @@ impl PowerMonitorApp {
                     .into_iter()
                     .enumerate()
                     {
+                        if detail { continue; }
                         let visible = self.visible_accumulated_series[series_index];
                         let marker = if series_index == 0 { "╱" } else { "╲" };
                         let text = if compact {
@@ -6735,37 +6780,21 @@ impl PowerMonitorApp {
                         }
                     }
 
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let pin_label = if self.cursor_pinned {
-                            if compact {
-                                language.pick("取消固定", "Unpin")
-                            } else {
-                                language.pick("取消固定游标", "Unpin cursor")
-                            }
-                        } else if compact {
-                            language.pick("固定", "Pin")
-                        } else {
-                            language.pick("固定游标", "Pin cursor")
-                        };
-                        if ui
-                            .add_enabled(
-                                self.cursor_readout.is_some(),
-                                egui::Button::new(pin_label).selected(self.cursor_pinned),
-                            )
-                            .clicked()
-                        {
-                            self.cursor_pinned = !self.cursor_pinned;
-                        }
-                    });
-                });
+                }); }
 
                 ui.add_space(4.0);
-                self.show_cursor_readout_strip(ui, self.cursor_readout);
+                let displayed_cursor = self.cursor_readout.filter(|readout| !detail ||
+                    (!readout.approximate
+                        && raw_boundary.is_none_or(|boundary| readout.time_seconds >= boundary)
+                        && (self.cursor_pinned || (readout.time_seconds >= selection.start_seconds && readout.time_seconds <= selection.end_seconds))));
+                self.show_cursor_readout_strip(ui, displayed_cursor, detail.then_some(scales[self.detail_channel]));
                 ui.add_space(4.0);
 
-                let visible_series = self.visible_series;
+                let visible_series = if detail {
+                    std::array::from_fn(|index| index == self.detail_channel)
+                } else { self.visible_series };
                 let visible_accumulated_series = self.visible_accumulated_series;
-                let scale_mode = self.chart_scale_mode;
+                let scale_mode = if detail { ChartScaleMode::Actual } else { self.chart_scale_mode };
                 let mut axes = Vec::with_capacity(3);
                 for (series_index, (label, color, unit, placement)) in [
                     (
@@ -6794,7 +6823,7 @@ impl PowerMonitorApp {
                         continue;
                     }
                     let scale = scales[series_index];
-                    let presentation = scale.presentation(unit);
+                    let presentation = EngineeringPresentation::for_range(scale, unit);
                     let axis_label = if scale_mode == ChartScaleMode::Relative {
                         if compact {
                             "%".to_string()
@@ -6825,14 +6854,15 @@ impl PowerMonitorApp {
                                 if scale_mode == ChartScaleMode::Relative {
                                     format!("{:.0}%", mark.value * 100.0)
                                 } else {
-                                    presentation.format_value(mark.value * scale.maximum)
+                                    presentation.format_value(scale.denormalize(mark.value))
                                 }
                             }),
                     );
                 }
                 let x_axis = AxisHints::new_x()
-                    .formatter(|mark: GridMark, _| format_plot_time(mark.value))
+                    .formatter(format_monitor_time_tick)
                     .tick_label_color(theme::text_secondary())
+                    .label_spacing(90.0..=110.0)
                     .min_thickness(28.0);
                 let normalized_points = [
                     vip_points[0]
@@ -6848,7 +6878,7 @@ impl PowerMonitorApp {
                         .map(|point| [point[0], scales[2].normalize(point[1])])
                         .collect::<Vec<_>>(),
                 ];
-                let normalized_raw_points = raw_vip_points.as_ref().map(|points| {
+                let normalized_trend_points = trend_vip_points.as_ref().map(|points| {
                     [
                         points[0]
                             .iter()
@@ -6880,7 +6910,7 @@ impl PowerMonitorApp {
                 let pinned_cursor = self.cursor_pinned.then_some(self.cursor_readout).flatten();
                 // Measure after the header, legends and cursor strip: their height changes
                 // with language, skin and available width. Reserve the navigator first.
-                let statistics_height = ui.text_style_height(&egui::TextStyle::Body) * 3.0 + 20.0;
+                let statistics_height = if self.scope_statistics_expanded && !detail { 76.0 } else { 38.0 };
                 let main_plot_height = (workspace_bottom
                     - ui.cursor().top()
                     - navigator_height
@@ -6890,6 +6920,9 @@ impl PowerMonitorApp {
                     .max(80.0);
                 let plot_response = Plot::new("combined_monitor_plot")
                     .height(main_plot_height)
+                    .x_grid_spacer(egui_plot::uniform_grid_spacer(|input| {
+                        [monitor_time_tick_step(input.base_step_size); 3]
+                    }))
                     .y_grid_spacer(|_| (0..=4).map(|index| GridMark { value: f64::from(index) / 4.0, step_size: 0.25 }).collect())
                     .link_axis("monitor_time_axis", [true, false])
                     .link_cursor("monitor_cursor", [true, false])
@@ -6914,6 +6947,11 @@ impl PowerMonitorApp {
                             [selection.start_seconds, 0.0],
                             [selection.end_seconds.max(selection.start_seconds + 0.001), 1.0],
                         ));
+                        if detail && let Some(boundary) = raw_boundary {
+                            plot_ui.span(Span::new(language.pick("无原始细节", "No raw detail"), selection.start_seconds..=boundary.min(selection.end_seconds))
+                                .fill(theme::text_muted().gamma_multiply(0.12))
+                                .border(egui::Stroke::NONE));
+                        }
                         for (index, interval) in pause_intervals.iter().enumerate() {
                             plot_ui.span(
                                 Span::new(
@@ -6939,20 +6977,20 @@ impl PowerMonitorApp {
                             );
                         }
 
-                        if let Some(raw_points) = &normalized_raw_points {
+                        if let Some(trend_points) = &normalized_trend_points {
                             for (index, (name, color)) in [
-                                (language.pick("电压原始包络", "Raw voltage envelope"), theme::VOLTAGE),
-                                (language.pick("电流原始包络", "Raw current envelope"), theme::CURRENT),
-                                (language.pick("功率原始包络", "Raw power envelope"), theme::POWER),
+                                (language.pick("电压中值趋势", "Voltage median trend"), theme::VOLTAGE),
+                                (language.pick("电流中值趋势", "Current median trend"), theme::CURRENT),
+                                (language.pick("功率中值趋势", "Power median trend"), theme::POWER),
                             ]
                             .into_iter()
                             .enumerate()
                             {
                                 if visible_series[index] {
                                     plot_ui.line(
-                                        Line::new(name, PlotPoints::from(raw_points[index].clone()))
-                                            .color(color.gamma_multiply(0.14))
-                                            .width(0.7),
+                                        Line::new(name, PlotPoints::from(trend_points[index].clone()))
+                                            .color(color.gamma_multiply(0.55))
+                                            .width(3.0),
                                     );
                                 }
                             }
@@ -6989,6 +7027,12 @@ impl PowerMonitorApp {
                                     .style(LineStyle::dashed_dense()),
                             );
                         }
+                        if detail && normalized_points[self.detail_channel].len() <= 200 {
+                            let channel = self.detail_channel;
+                            plot_ui.points(Points::new(language.pick("原始采样点", "Raw samples"), normalized_points[channel].clone())
+                                .color([theme::VOLTAGE, theme::CURRENT, theme::POWER][channel])
+                                .radius(2.0));
+                        }
                         let readout = if let Some(readout) = pinned_cursor {
                             readout
                         } else {
@@ -6997,8 +7041,10 @@ impl PowerMonitorApp {
                                 .hovered()
                                 .then(|| plot_ui.pointer_coordinate().map(|point| point.x))
                                 .flatten()?;
+                            if detail && raw_boundary.is_some_and(|boundary| hovered_time < boundary) { return None; }
                             self.cursor_readout_at(hovered_time)?
                         };
+                        if detail && (readout.approximate || raw_boundary.is_some_and(|boundary| readout.time_seconds < boundary)) { return None; }
                         plot_ui.vline(
                             VLine::new(language.pick("联动游标", "Linked cursor"), readout.time_seconds)
                                 .color(theme::text_secondary())
@@ -7033,8 +7079,8 @@ impl PowerMonitorApp {
                         egui::WidgetType::Other,
                         true,
                         language.pick(
-                            "电压、电流、功率、累计能量和累计容量联动曲线；移动鼠标读取同一时刻数值",
-                            "Linked voltage, current, power, energy, and capacity traces. Move the pointer to inspect matching values.",
+                            "电压、电流绝对值、功率绝对值及累计曲线；移动鼠标读取同一时刻数值",
+                            "Voltage, absolute current, absolute power and cumulative traces. Move the pointer to inspect matching values.",
                         ),
                     )
                 });
@@ -7078,6 +7124,10 @@ impl PowerMonitorApp {
                     && !self.cursor_pinned
                 {
                     self.cursor_readout = Some(readout);
+                } else if detail && plot_response.response.hovered() && !self.cursor_pinned {
+                    // Do not show the last recent sample over an unavailable
+                    // historical interval.
+                    self.cursor_readout = None;
                 }
 
                 if cumulative_track_visible {
@@ -7232,19 +7282,146 @@ impl PowerMonitorApp {
         self.reset_plots_requested = false;
     }
 
-    fn show_scope_statistics_bar(&self, ui: &mut egui::Ui, selection: NavigatorSelection, compact: bool) {
+    /// Statistics of visible raw samples, never of median-filtered or
+    /// min/max-decimated display vertices. Includes paused live samples to
+    /// match the observed waveform; recording integrals keep their own rules.
+    fn window_raw_statistics(&self, selection: NavigatorSelection) -> RecordingSessionStatistics {
+        let mut statistics = RecordingSessionStatistics::default();
+        let mut push = |time: f64, voltage: i64, current: i64, power: i64| {
+            if time >= selection.start_seconds && time <= selection.end_seconds {
+                statistics.voltage.push(voltage as f64 / 1_000_000.0);
+                statistics.current.push((current as f64 / 1_000_000.0).abs());
+                statistics.power.push((power as f64 / 1_000_000.0).abs());
+            }
+        };
+        match self.plot_source {
+            PlotSource::Live => {
+                for sample in &self.data_points {
+                    if sample.elapsed_seconds() >= self.live_plot_origin_seconds {
+                        push(
+                            self.live_display_time(sample.elapsed_seconds()),
+                            sample.vbus_uv,
+                            sample.ibus_ua,
+                            sample.power_uw,
+                        );
+                    }
+                }
+            }
+            PlotSource::Imported => {
+                if let Some(recording) = &self.imported_recording {
+                    for sample in recording.samples.iter() {
+                        push(
+                            sample.elapsed_seconds(),
+                            sample.vbus_uv,
+                            sample.ibus_ua,
+                            sample.power_uw,
+                        );
+                    }
+                }
+            }
+            PlotSource::Offline => {
+                if let Some(view) = &self.offline_view {
+                    for sample in &view.samples {
+                        push(
+                            sample.elapsed_seconds(),
+                            sample.vbus_uv,
+                            sample.ibus_ua,
+                            sample.power_uw,
+                        );
+                    }
+                }
+            }
+        }
+        statistics
+    }
+
+    fn raw_cache_boundary(&self, selection: NavigatorSelection) -> Option<f64> {
+        if self.plot_source != PlotSource::Live {
+            return None;
+        }
+        let first = self.data_points.front()?;
+        let time = self.live_display_time(first.elapsed_seconds());
+        // Bucket endpoints may overlap the first retained raw sample. The
+        // retained raw boundary, not those endpoints, determines availability.
+        (first.elapsed_seconds() > self.live_plot_origin_seconds + f64::EPSILON
+            && time > selection.start_seconds + f64::EPSILON)
+            .then_some(time)
+    }
+
+    fn show_scope_statistics_bar(&mut self, ui: &mut egui::Ui, selection: NavigatorSelection, compact: bool) {
         let language = self.language;
-        let all = self.full_scope_statistics();
-        let window = self.window_scope_statistics(selection);
+        let detail = self.chart_observation_mode == ChartObservationMode::Detail;
+        let all = if detail {
+            ScopeStatistics::default()
+        } else {
+            self.full_scope_statistics()
+        };
+        let window = if detail {
+            ScopeStatistics::default()
+        } else {
+            self.window_scope_statistics(selection)
+        };
+        let boundary = self.raw_cache_boundary(selection);
+        let unit = [
+            MeasurementUnit::Voltage,
+            MeasurementUnit::Current,
+            MeasurementUnit::Power,
+        ][self.detail_channel];
         let energy = EnergyPresentation::for_values([all.cumulative_energy_uwh, window.cumulative_energy_uwh]);
         let width = ui.available_width();
         egui::Frame::NONE
             .fill(theme::panel_raised())
-            .stroke(egui::Stroke::new(1.0, theme::divider()))
+            .stroke(egui::Stroke::NONE)
             .corner_radius(egui::CornerRadius::same(8))
             .inner_margin(egui::Margin::symmetric(if compact { 8 } else { 12 }, 5))
             .show(ui, |ui| {
-                ui.set_min_width((width - if compact { 16.0 } else { 24.0 }).max(240.0));
+                ui.set_width((width - if compact { 16.0 } else { 24.0 }).max(0.0));
+                if detail {
+                    let signal = self.window_raw_statistics(selection);
+                    let channel = [signal.voltage, signal.current, signal.power][self.detail_channel];
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new(match self.detail_channel {
+                            0 => language.pick("选区 U", "Selection U"),
+                            1 => language.pick("选区 |I|", "Selection |I|"),
+                            _ => language.pick("选区 |P|", "Selection |P|"),
+                        }).size(11.0).color(theme::text_secondary()));
+                        if let Some(values) = channel.readout() {
+                            let presentation = EngineeringPresentation::for_range(TraceRange { minimum: values.minimum, maximum: values.maximum }, unit);
+                            for (label, value) in [
+                                (language.pick("最小", "Min"), values.minimum),
+                                (language.pick("样本平均", "Mean"), values.average),
+                                (language.pick("最大", "Max"), values.maximum),
+                                (language.pick("峰峰", "P–P"), values.maximum - values.minimum),
+                            ] {
+                                ui.label(egui::RichText::new(format!("{label} {} {}", presentation.format_value(value), presentation.symbol)).monospace().size(11.0));
+                            }
+                            ui.label(egui::RichText::new(format!("{} pts", channel.count)).monospace().size(11.0));
+                        } else {
+                            ui.label(egui::RichText::new(language.pick("此区间无原始样本", "No raw samples in this interval")).size(11.0));
+                        }
+                    }).response.on_hover_text(language.pick(
+                        "电流和功率沿用绝对值口径。统计为所见原始样本的算术平均，包含暂停时实时采样。峰峰值包含尖峰，不等同于高频纹波测量。",
+                        "Current and power are absolute values. Arithmetic mean of visible raw samples, including samples during pauses. Peak-to-peak includes spikes; it is not a high-frequency ripple measurement.",
+                    ));
+                    return;
+                }
+                if !self.scope_statistics_expanded {
+                    let (name, statistics) = if self.chart_follow_mode == ChartFollowMode::FullSession {
+                        (language.pick("全部", "All"), all)
+                    } else {
+                        (language.pick("选区", "Selection"), window)
+                    };
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new(if statistics.approximate { language.pick("缓存内统计", "Cached portion") } else { name }).size(11.0).color(theme::text_secondary()));
+                        for text in [format_plot_time(statistics.duration_seconds), format_capacity(statistics.capacity_uah), energy.format(statistics.cumulative_energy_uwh), format!("{} pts", statistics.points)] {
+                            ui.label(egui::RichText::new(text).monospace().size(11.0));
+                        }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.small_button(language.pick("展开统计", "More stats")).clicked() { self.scope_statistics_expanded = true; }
+                        });
+                    });
+                    return;
+                }
                 egui::Grid::new("scope_statistics_grid")
                     .num_columns(5)
                     .spacing([if compact { 12.0 } else { 22.0 }, 2.0])
@@ -7265,8 +7442,8 @@ impl PowerMonitorApp {
                             (language.pick("窗口", "Window"), window),
                         ] {
                             ui.label(
-                                egui::RichText::new(if statistics.approximate {
-                                    format!("≈{name}")
+                                egui::RichText::new(if statistics.approximate && boundary.is_some() {
+                                    language.pick("缓存内", "Cached").to_string()
                                 } else {
                                     name.to_string()
                                 })
@@ -7280,6 +7457,7 @@ impl PowerMonitorApp {
                             ui.end_row();
                         }
                     });
+                if ui.small_button(language.pick("收起统计", "Less stats")).clicked() { self.scope_statistics_expanded = false; }
             });
     }
 
@@ -8242,7 +8420,7 @@ impl PowerMonitorApp {
                         settings_form_row(
                             ui,
                             form,
-                            language.pick("曲线降噪", "Trace smoothing"),
+                            language.pick("趋势叠加", "Trend overlay"),
                             SETTINGS_FORM_ROW_HEIGHT,
                             |control| {
                                 let filter_response = egui::ComboBox::from_id_salt("settings_display_filter")
@@ -8258,8 +8436,8 @@ impl PowerMonitorApp {
                                         }
                                     });
                                 filter_response.response.on_hover_text(language.pick(
-                                    "五点中值滤波只改变屏幕曲线；游标、统计、录制和导出始终使用原始采样。",
-                                    "The 5-point median filter affects only the displayed traces. Cursor values, statistics, recordings, and exports always use raw samples.",
+                                    "叠加五点中值趋势线，始终保留原始曲线和极值。游标、统计、录制和导出始终使用原始采样。",
+                                    "Overlay a 5-sample median trend while retaining the raw trace and extrema. Cursor values, statistics, recordings, and exports always use raw samples.",
                                 ));
                             },
                         );
@@ -10253,6 +10431,43 @@ mod tests {
     use polars::prelude::{CsvReader, ParquetReader, SerReader};
 
     #[test]
+    fn monitor_time_ticks_keep_long_labels_apart_without_losing_intermediate_marks() {
+        for seconds in [2.0, 100.0, 3_600.0, 86_400.0] {
+            for width in [480.0, 650.0, 1_000.0] {
+                let base_step = seconds / width * 8.0;
+                let step = monitor_time_tick_step(base_step);
+                assert!(step / seconds * width >= 110.0);
+                assert!(step >= 0.1);
+                let magnitude = 10_f64.powf(step.log10().floor());
+                assert!([1.0, 2.0, 5.0, 10.0].contains(&(step / magnitude)));
+            }
+        }
+        let spacer = egui_plot::uniform_grid_spacer(|input| [monitor_time_tick_step(input.base_step_size); 3]);
+        let marks = spacer(egui_plot::GridInput {
+            bounds: (0.0, 100.0),
+            base_step_size: 100.0 / 650.0 * 8.0,
+        });
+        assert_eq!(
+            marks.iter().map(|mark| mark.value).collect::<Vec<_>>(),
+            vec![0.0, 20.0, 40.0, 60.0, 80.0]
+        );
+        assert!(marks.windows(2).all(|pair| pair[1].value - pair[0].value == 20.0));
+        assert_eq!(format_plot_time(marks[1].value), "00:00:20.0");
+        assert_eq!(format_monitor_time_tick(marks[1], &(0.0..=100.0)), "00:00:20.0");
+        assert!(format_monitor_time_tick(marks[0], &(0.0..=100.0)).is_empty());
+        assert!(
+            format_monitor_time_tick(
+                GridMark {
+                    value: 99.9,
+                    step_size: 20.0
+                },
+                &(0.0..=100.0)
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
     fn low_ranges_use_engineering_units_and_keep_distinct_ticks() {
         let current_scale = AxisScale::from_visible_max(0.003);
         assert_eq!(current_scale.maximum, 0.005);
@@ -10499,6 +10714,39 @@ mod tests {
     }
 
     #[test]
+    fn instrument_cards_keep_their_reserved_height_after_drawing_headers() {
+        let ctx = egui::Context::default();
+        for compact in [true, false] {
+            let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+                ui.set_width(if compact { 202.0 } else { 218.0 });
+                let start = ui.next_widget_position().y;
+                let card_height = if compact { 78.0 } else { 94.0 };
+                for (label, unit, color) in [
+                    ("Voltage", MeasurementUnit::Voltage, theme::VOLTAGE),
+                    ("Current", MeasurementUnit::Current, theme::CURRENT),
+                    ("Power", MeasurementUnit::Power, theme::POWER),
+                ] {
+                    let card_top = ui.next_widget_position().y;
+                    instrument_card(
+                        ui,
+                        InstrumentCardData {
+                            label,
+                            value: Some(1.0),
+                            unit,
+                            color,
+                            statistics: None,
+                            compact,
+                            readout_status: "Live",
+                        },
+                    );
+                    assert!(ui.next_widget_position().y >= card_top + card_height);
+                }
+                assert!(ui.min_rect().bottom() >= start + card_height * 3.0);
+            });
+        }
+    }
+
+    #[test]
     fn compact_chart_reserves_the_full_navigator_height() {
         let (_tx, rx) = mpsc::unbounded_channel();
         let (cmd, _commands) = mpsc::unbounded_channel();
@@ -10518,6 +10766,134 @@ mod tests {
                     app.show_combined_monitor_chart(&mut chart, true);
                     assert!(chart.min_rect().bottom() <= rect.bottom(), "{:?}", chart.min_rect());
                 });
+            }
+        }
+    }
+
+    #[test]
+    fn detail_ranges_and_tick_precision_retain_raw_spikes() {
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let (cmd, _commands) = mpsc::unbounded_channel();
+        let mut app = PowerMonitorApp::new(rx, cmd);
+        app.chart_observation_mode = ChartObservationMode::Detail;
+        app.detail_channel = 0;
+        let points = [vec![[0.0, 9.0], [1.0, 9.03]], vec![], vec![]];
+        let range = app.monitor_trace_ranges(&points)[0];
+        assert!(range.normalize(9.03) - range.normalize(9.0) > 0.8);
+        let presentation = EngineeringPresentation::for_range(range, MeasurementUnit::Voltage);
+        assert_ne!(presentation.format_value(9.0), presentation.format_value(9.03));
+        assert_ne!(presentation.format_value(9.0), presentation.format_value(9.003));
+        assert!(presentation.decimals >= 3);
+
+        app.detail_range_mode = RangeMode::Locked;
+        let mut spike = points.clone();
+        spike[0].push([2.0, 12.0]);
+        let locked = app.monitor_trace_ranges(&spike)[0];
+        assert_eq!(range, locked);
+        assert!(locked.normalize(12.0) > 1.0); // Never silently clamp it.
+        app.detail_range_mode = RangeMode::Local;
+        assert!(app.monitor_trace_ranges(&spike)[0].contains(12.0));
+    }
+
+    #[test]
+    fn selection_mean_uses_raw_samples_not_decimated_vertices() {
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let (cmd, _commands) = mpsc::unbounded_channel();
+        let mut app = PowerMonitorApp::new(rx, cmd);
+        app.recording_paused = true;
+        for index in 0..101 {
+            let mut sample = test_measurement(0.0);
+            sample.elapsed_us = index * 20_000;
+            sample.ibus_ua = if index == 50 { 100_000_000 } else { 0 };
+            app.data_points.push_back(sample);
+        }
+        let selection = NavigatorSelection {
+            start_seconds: 0.0,
+            end_seconds: 2.0,
+        };
+        app.display_filter = DisplayFilter::Median5;
+        let statistics = app.window_raw_statistics(selection).current;
+        let readout = statistics.readout().unwrap();
+        assert_eq!(statistics.count, 101);
+        assert_eq!(readout.maximum, 100.0);
+        assert!((readout.average - 100.0 / 101.0).abs() < 1e-12);
+        for budget in [12, 1000] {
+            let raw = app.source_vip_points(selection, budget, DisplayFilter::Raw);
+            let range = app.monitor_trace_ranges(&raw)[1];
+            assert!(range.contains(100.0));
+            assert_eq!(app.window_raw_statistics(selection).current.readout(), Some(readout));
+        }
+    }
+
+    #[test]
+    fn old_overview_is_not_misrepresented_as_raw_detail() {
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let (cmd, _commands) = mpsc::unbounded_channel();
+        let mut app = PowerMonitorApp::new(rx, cmd);
+        app.navigator_history.push_values(1.0, [9.0, 0.1, 0.9]);
+        let mut sample = test_measurement(0.0);
+        sample.elapsed_us = 10_000_000;
+        app.data_points.push_back(sample);
+        let selection = NavigatorSelection {
+            start_seconds: 0.0,
+            end_seconds: 5.0,
+        };
+        assert_eq!(app.raw_cache_boundary(selection), Some(10.0));
+        assert!(!app.source_vip_points(selection, 100, DisplayFilter::Raw)[0].is_empty());
+        app.chart_observation_mode = ChartObservationMode::Detail;
+        assert!(app.source_vip_points(selection, 100, DisplayFilter::Raw)[0].is_empty());
+        assert!(app.window_raw_statistics(selection).voltage.readout().is_none());
+
+        // A bucket endpoint can sit after the first retained raw point while
+        // containing older samples. It must not hide the raw-cache boundary.
+        app.navigator_history.clear();
+        app.navigator_history.push_values(10.01, [9.0, 0.1, 0.9]);
+        assert_eq!(app.raw_cache_boundary(selection), Some(10.0));
+    }
+
+    #[test]
+    fn observation_modes_preserve_capture_cursor_and_window_in_both_languages() {
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let (cmd, _commands) = mpsc::unbounded_channel();
+        let mut app = PowerMonitorApp::new(rx, cmd);
+        app.recording_phase = RecordingPhase::Recording;
+        app.recording_session = true;
+        app.total_samples = 100;
+        app.data_points.push_back(test_measurement(0.0));
+        app.cursor_pinned = true;
+        let selection = NavigatorSelection {
+            start_seconds: 0.0,
+            end_seconds: 0.001,
+        };
+        app.chart_follow_mode = ChartFollowMode::Manual;
+        app.chart_viewport.selection = Some(selection);
+        let ctx = egui::Context::default();
+        for language in Language::ALL {
+            app.language = language;
+            for mode in [ChartObservationMode::Overview, ChartObservationMode::Detail] {
+                app.chart_observation_mode = mode;
+                for _ in 0..3 {
+                    let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+                        let rect = egui::Rect::from_min_size(ui.next_widget_position(), egui::vec2(740.0, 580.0));
+                        let mut chart = ui.new_child(
+                            egui::UiBuilder::new()
+                                .max_rect(rect)
+                                .layout(egui::Layout::top_down(egui::Align::Min)),
+                        );
+                        app.show_combined_monitor_chart(&mut chart, true);
+                        assert!(
+                            chart.min_rect().bottom() <= rect.bottom(),
+                            "{mode:?} {language:?}: {:?}",
+                            chart.min_rect()
+                        );
+                    });
+                }
+                assert_eq!(app.recording_phase, RecordingPhase::Recording);
+                assert_eq!(app.total_samples, 100);
+                assert_eq!(app.data_points.len(), 1);
+                assert!(app.cursor_pinned);
+                assert_eq!(app.chart_follow_mode, ChartFollowMode::Manual);
+                assert_eq!(app.chart_viewport.selection, Some(selection));
             }
         }
     }
@@ -11117,7 +11493,7 @@ mod tests {
         assert!(!restored.auto_pause_enabled);
         assert_eq!(restored.auto_pause_threshold_mw, 100);
         assert_eq!(restored.auto_pause_delay_ms, 3_000);
-        assert_eq!(restored.display_filter, DisplayFilter::Median5);
+        assert_eq!(restored.display_filter, DisplayFilter::Raw);
         assert_eq!(restored.visible_accumulated_series, [true; 2]);
         assert_eq!(restored.chart_scale_mode, ChartScaleMode::Actual);
     }
