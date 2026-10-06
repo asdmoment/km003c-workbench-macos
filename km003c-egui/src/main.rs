@@ -45,7 +45,7 @@ use recording_session::{
     RecordingTimeInterval, SessionState, discover_recoverable_sessions, merge_session_segments, read_sidecar,
     write_manifest, write_sidecar,
 };
-use sleep_assertion::IdleSleepAssertion;
+use sleep_assertion::{IdleSleepAssertion, StreamingActivity};
 use std::collections::{HashMap, VecDeque};
 #[cfg(unix)]
 use std::fs::{File, OpenOptions};
@@ -1619,6 +1619,9 @@ struct PowerMonitorApp {
     /// turn off; only automatic system sleep is inhibited.
     sleep_protection_enabled: bool,
     sleep_assertion: Option<IdleSleepAssertion>,
+    /// Held while the device streams so App Nap cannot throttle USB polling
+    /// behind a hidden window. Reconciled with `streaming` every logic pass.
+    streaming_activity: Option<StreamingActivity>,
 }
 
 struct FinalizingSegment {
@@ -1797,6 +1800,7 @@ impl PowerMonitorApp {
             usb_reset: false,
             sleep_protection_enabled: true,
             sleep_assertion: None,
+            streaming_activity: None,
         }
     }
 
@@ -4743,6 +4747,17 @@ impl PowerMonitorApp {
         }
     }
 
+    /// Holds the App Nap opt-out exactly while samples are expected. Without
+    /// it, macOS may coalesce the USB polling timers of a hidden window long
+    /// enough for the device queue to overflow or for streaming to stall.
+    fn sync_streaming_activity(&mut self) {
+        match (self.streaming, self.streaming_activity.is_some()) {
+            (true, false) => self.streaming_activity = Some(StreamingActivity::begin()),
+            (false, true) => self.streaming_activity = None,
+            _ => {}
+        }
+    }
+
     /// Runs even when eframe skips painting an occluded or minimized window.
     /// Sampling, recording and their next wake-up must never depend on `ui`.
     fn update_runtime(&mut self, ctx: &egui::Context) {
@@ -4761,6 +4776,7 @@ impl PowerMonitorApp {
         let usb_backlog = self.process_messages();
         self.finish_measurement_restart();
         self.update_demo_data();
+        self.sync_streaming_activity();
         if usb_backlog {
             ctx.request_repaint();
         } else if self.streaming {

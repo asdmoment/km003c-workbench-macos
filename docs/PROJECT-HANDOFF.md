@@ -77,7 +77,7 @@ d60b87cac14e246445c6c7f630e74fee252379a5ad53e871b6760750e60a1d87
 | `offline_view.rs` / `offline_export.rs` | 设备离线数据转换与导出 |
 | `pd_decoder.rs` / `pd_connection.rs` / `pd_trace_view.rs` | 当前合同、连接状态及固件 trace 展示 |
 | `preferences.rs` / `i18n.rs` / `theme.rs` | 持久化偏好、中英文文案及动态主题 |
-| `sleep_assertion.rs` | 录制期间通过 `caffeinate -i` 防止空闲睡眠 |
+| `sleep_assertion.rs` | 进程内 `NSProcessInfo` activity：录制期间防空闲睡眠（等同 `caffeinate -i`），采样期间退出 App Nap；进程退出时由系统自动回收 |
 | `assets/` | 嵌入的应用图标、日系壁纸等素材 |
 
 运行路径：USB 任务 → `UsbMessage` → `App::logic` → `update_runtime` → `process_messages` → 积分及录制提交 → 后台写盘事件。`App::ui` 调用 `show_workbench` 绘制。

@@ -32,5 +32,11 @@ tracing-appender = "0.2.3"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.189"
 
+# In-process NSProcessInfo activities for idle-sleep and App Nap protection.
+# Both crates are already part of the macOS dependency graph through winit.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6.4"
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSProcessInfo", "NSString"] }
+
 [dev-dependencies]
 hex = "0.4.3"
