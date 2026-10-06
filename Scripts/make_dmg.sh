@@ -2,10 +2,12 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=Scripts/app_version.sh
+source "$ROOT_DIR/Scripts/app_version.sh"
 DIST_DIR="${DIST_DIR:-$ROOT_DIR/dist}"
-APP_DIR="$DIST_DIR/KM003C 工作台.app"
+APP_DIR="$DIST_DIR/$APP_NAME"
 STAGING_DIR="$DIST_DIR/dmg-staging"
-DMG_PATH="$DIST_DIR/KM003C-Workbench-v0.1.0-macOS-universal.dmg"
+DMG_PATH="$DIST_DIR/$DMG_NAME"
 
 if [[ ! -d "$APP_DIR" ]]; then
   "$ROOT_DIR/Scripts/package_app.sh"

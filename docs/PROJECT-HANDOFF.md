@@ -137,11 +137,11 @@ python3 -m unittest discover -s Scripts -p test_release_version.py
 ./Scripts/build_release.sh
 ```
 
-`build_release.sh` 依次执行 `package_app.sh`、`make_dmg.sh`、`verify_dmg.sh`。构建需要 Rust（当前 Cargo 声明最低 1.97）、Xcode 命令行工具以及两个 macOS Rust target。产物在 `dist/`。
+`build_release.sh` 依次执行 `package_app.sh`、`make_dmg.sh`、`verify_dmg.sh`。构建需要 Rust（当前 Cargo 声明最低 1.97）、Xcode 命令行工具以及两个 macOS Rust target。产物在 `dist/`。本机快速验证可用 `ARCHS=arm64 ./Scripts/build_release.sh`，只编 Apple Silicon，DMG 名以 `-macOS-arm64.dmg` 结尾，不能当作 Universal 发布包。
 
-发布标签从 `Distribution/Info.plist` 的 App 版本校验，支持 `v0.1.0`、`v0.1.0-YYYYMMDD` 和同日构建序号 `v0.1.0-YYYYMMDD-N`。不能拿 workspace 的 `0.3.0` 校验应用标签。当前 DMG 名称仍固定含 `v0.1.0`；以后升级 App 版本时检查 plist、打包脚本和文件名的一致性。
+App 版本、构建号、Bundle ID 和最低系统版本只在 `Distribution/Info.plist` 维护：打包脚本经 `Scripts/app_version.sh` 读取它并生成 DMG 文件名，`verify_dmg.sh` 校验包内 plist 与之一致，`i18n.rs` 的关于页常量由单元测试比对。发布标签同样从这里校验，支持 `v0.1.0`、`v0.1.0-YYYYMMDD` 和同日构建序号 `v0.1.0-YYYYMMDD-N`。不能拿 workspace 的 `0.3.0` 校验应用标签。
 
-GitHub workflow 构建的是跨平台二进制压缩包，标签触发时生成草稿 Release；手动触发只验证、不发布。macOS App/DMG 由本地脚本生成，不能将 CI 的 tar.gz 当作 DMG。
+GitHub Release workflow 在 macOS 上调用同一个 `build_release.sh`，产出 ad-hoc 签名的 Universal DMG 并挂载校验；Linux 与 Windows 仍为二进制压缩包。标签触发时生成草稿 Release；手动触发只验证、不发布。
 
 安装前检查应用是否正在录制，先保存或安全封口、正常退出，再备份并替换 `/Applications/KM003C 工作台.app`。保留用户配置和 Pending 目录。安装后核对 binary hash、Universal 架构、签名、实际启动；不要仅用版本号判断新旧，因为此前多次修订沿用 `0.1.0 (1)`。
 

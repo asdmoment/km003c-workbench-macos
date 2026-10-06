@@ -2,8 +2,10 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=Scripts/app_version.sh
+source "$ROOT_DIR/Scripts/app_version.sh"
 DIST_DIR="${DIST_DIR:-$ROOT_DIR/dist}"
-DMG_PATH="${1:-$DIST_DIR/KM003C-Workbench-v0.1.0-macOS-universal.dmg}"
+DMG_PATH="${1:-$DIST_DIR/$DMG_NAME}"
 MOUNT_POINT="$(mktemp -d "${TMPDIR:-/tmp}/km003c-dmg.XXXXXX")"
 
 cleanup() {
@@ -20,15 +22,34 @@ if [[ -f "$DMG_PATH.sha256" ]]; then
 fi
 hdiutil attach -nobrowse -readonly -mountpoint "$MOUNT_POINT" "$DMG_PATH" >/dev/null
 
-APP="$MOUNT_POINT/KM003C 工作台.app"
+APP="$MOUNT_POINT/$APP_NAME"
+APP_PLIST="$APP/Contents/Info.plist"
 [[ -d "$APP" ]]
 [[ -L "$MOUNT_POINT/Applications" ]]
 [[ -f "$APP/Contents/Resources/WITRN-RS-参考迁移.md" ]]
 [[ -f "$MOUNT_POINT/WITRN-RS-参考迁移.md" ]]
-plutil -lint "$APP/Contents/Info.plist"
-[[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Contents/Info.plist")" == "com.weixun.km003cworkbench" ]]
-[[ "$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' "$APP/Contents/Info.plist")" == "11.0" ]]
-lipo -info "$APP/Contents/MacOS/KM003CWorkbench"
+plutil -lint "$APP_PLIST"
+
+# The packaged bundle must describe exactly what Distribution/Info.plist
+# declares; a stale DMG from an earlier build fails here.
+check_plist() {
+  local actual
+  actual="$(/usr/libexec/PlistBuddy -c "Print :$1" "$APP_PLIST")"
+  if [[ "$actual" != "$2" ]]; then
+    echo "$1 is '$actual', expected '$2'" >&2
+    exit 1
+  fi
+}
+check_plist CFBundleIdentifier "$APP_BUNDLE_ID"
+check_plist CFBundleShortVersionString "$APP_VERSION"
+check_plist CFBundleVersion "$APP_BUILD"
+check_plist LSMinimumSystemVersion "$APP_MIN_MACOS"
+
+BINARY="$APP/Contents/MacOS/KM003CWorkbench"
+lipo -info "$BINARY"
+for arch in $ARCHS; do
+  lipo "$BINARY" -verify_arch "$arch"
+done
 codesign --verify --deep --strict "$APP"
-file "$APP/Contents/MacOS/KM003CWorkbench"
+file "$BINARY"
 echo "DMG verification passed: $DMG_PATH"
