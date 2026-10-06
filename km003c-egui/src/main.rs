@@ -67,6 +67,13 @@ use tracing::{debug, error, info, warn};
 /// any remaining backlog is handled on the next repaint.
 const MAX_USB_MESSAGES_PER_FRAME: usize = 64;
 
+/// How long streaming may go without AdcQueue samples before it is restarted.
+/// The firmware stops streaming on its own when it is not polled for a while
+/// (for example while the host was throttled or asleep) yet keeps answering
+/// PD requests, so the session sees no error. At the slowest rate a sample is
+/// due every 0.5 s.
+const ADCQUEUE_STALL_TIMEOUT: Duration = Duration::from_secs(3);
+
 struct SingleInstanceGuard {
     #[cfg(unix)]
     lock_file: File,
@@ -10153,6 +10160,7 @@ async fn run_streaming_session(
     // Streaming loop - poll for data and handle commands
     let mut error_count = 0;
     let mut pd_trace_enabled = false;
+    let mut last_samples = Instant::now();
     const MAX_ERRORS: u32 = 10;
 
     loop {
@@ -10166,13 +10174,15 @@ async fn run_streaming_session(
                     let _ = device.stop_graph_mode().await;
                     let _ = tx.send(UsbMessage::StreamingStopped);
 
-                    // Start with new rate
+                    // Start with new rate. On failure the stall check below
+                    // restarts the previous rate or reconnects.
                     if let Err(e) = start_streaming(&mut device, new_rate, tx).await {
                         error!("Failed to restart streaming: {}", e);
                         let _ = tx.send(UsbMessage::Error(format!("Restart failed: {}", e)));
                         continue;
                     }
                     current_rate = new_rate;
+                    last_samples = Instant::now();
                 }
             }
             Ok(UsbCommand::SetPdTraceEnabled(enabled)) => {
@@ -10207,6 +10217,7 @@ async fn run_streaming_session(
                     )));
                     break;
                 }
+                last_samples = Instant::now();
             }
             Ok(UsbCommand::DownloadOfflineLog(metadata)) => {
                 info!(
@@ -10237,6 +10248,7 @@ async fn run_streaming_session(
                     )));
                     break;
                 }
+                last_samples = Instant::now();
             }
             Ok(UsbCommand::Disconnect) => {
                 info!("Disconnect command received");
@@ -10265,10 +10277,25 @@ async fn run_streaming_session(
                     && !queue_data.samples.is_empty()
                 {
                     debug!("Received {} samples", queue_data.samples.len());
+                    last_samples = Instant::now();
                     if tx.send(UsbMessage::Samples(queue_data.samples.clone())).is_err() {
                         warn!("UI closed, stopping");
                         break;
                     }
+                } else if last_samples.elapsed() >= ADCQUEUE_STALL_TIMEOUT {
+                    warn!(
+                        "No AdcQueue samples for {:.1} s, restarting streaming",
+                        last_samples.elapsed().as_secs_f32()
+                    );
+                    if let Err(error) = restart_streaming(&mut device, current_rate, tx).await {
+                        // The firmware can reject StartGraph as well after a
+                        // long stall. Ending the session hands it to the
+                        // reconnect path, which authenticates again and
+                        // resumes a recording that waits for this device.
+                        warn!("Failed to restart stalled streaming, reconnecting: {error}");
+                        break;
+                    }
+                    last_samples = Instant::now();
                 }
 
                 if let Some(stream) = packet.get_pd_events() {
@@ -10328,6 +10355,16 @@ async fn start_streaming(
     device.start_graph_mode(rate).await?;
     let _ = tx.send(UsbMessage::StreamingStarted(rate));
     Ok(())
+}
+
+async fn restart_streaming(
+    device: &mut KM003C,
+    rate: GraphSampleRate,
+    tx: &mpsc::UnboundedSender<UsbMessage>,
+) -> Result<(), km003c_lib::error::KMError> {
+    device.stop_graph_mode().await?;
+    let _ = tx.send(UsbMessage::StreamingStopped);
+    start_streaming(device, rate, tx).await
 }
 
 const DEMO_APP_ID: &str = "com.weixun.km003cworkbench.demo";
