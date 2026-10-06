@@ -10456,7 +10456,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(icon) = icon {
         viewport = viewport.with_icon(icon);
     }
-    let options = eframe::NativeOptions {
+    let mut options = eframe::NativeOptions {
         persist_window: true,
         // `persistence_path` is a file, while `storage_dir` is the directory
         // shared by logs and recoverable recordings. Passing the directory
@@ -10468,6 +10468,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         viewport,
         ..Default::default()
     };
+    prefer_low_power_gpu(&mut options);
 
     eframe::run_native(
         &runtime_title,
@@ -10483,6 +10484,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }),
     )
     .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
+}
+
+/// egui-wgpu requests a `HighPerformance` adapter by default. On dual-GPU
+/// Intel MacBook Pros that keeps the discrete GPU powered for as long as the
+/// workbench is open, although plotting never needs it. Prefer the integrated
+/// GPU unless `WGPU_POWER_PREF` says otherwise; single-GPU Macs are unaffected.
+fn prefer_low_power_gpu(options: &mut eframe::NativeOptions) {
+    if let eframe::egui_wgpu::WgpuSetup::CreateNew(setup) = &mut options.wgpu_options.wgpu_setup
+        && eframe::wgpu::PowerPreference::from_env().is_none()
+    {
+        setup.power_preference = eframe::wgpu::PowerPreference::LowPower;
+    }
 }
 
 fn init_logging(runtime_app_id: &str) {
@@ -11457,6 +11470,19 @@ mod tests {
             i18n::connection_guidance(Language::English, ConnectionPhase::DeviceBusy, Some("resource busy")).unwrap();
         assert!(guidance.contains("Close other POWER-Z"));
         assert!(i18n::connection_guidance(Language::English, ConnectionPhase::Streaming, None).is_none());
+    }
+
+    #[test]
+    fn native_options_prefer_the_integrated_gpu() {
+        if eframe::wgpu::PowerPreference::from_env().is_some() {
+            return; // An explicit WGPU_POWER_PREF intentionally wins.
+        }
+        let mut options = eframe::NativeOptions::default();
+        prefer_low_power_gpu(&mut options);
+        let eframe::egui_wgpu::WgpuSetup::CreateNew(setup) = &options.wgpu_options.wgpu_setup else {
+            panic!("eframe's default wgpu setup creates its own device");
+        };
+        assert_eq!(setup.power_preference, eframe::wgpu::PowerPreference::LowPower);
     }
 
     #[test]
