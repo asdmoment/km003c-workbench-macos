@@ -74,6 +74,10 @@ const MAX_USB_MESSAGES_PER_FRAME: usize = 64;
 /// due every 0.5 s.
 const ADCQUEUE_STALL_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// Upper bound for letting the USB task send StopGraph and release the device
+/// while the application quits. A normal stop takes a few milliseconds.
+const USB_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(1500);
+
 struct SingleInstanceGuard {
     #[cfg(unix)]
     lock_file: File,
@@ -4750,6 +4754,33 @@ impl PowerMonitorApp {
                 RecordingPhase::Paused | RecordingPhase::Interrupted => self.resume_recording(),
                 RecordingPhase::Idle | RecordingPhase::Saved => self.start_recording(),
                 RecordingPhase::WaitingForReconnect | RecordingPhase::Recovering | RecordingPhase::Finalizing => {}
+            }
+        }
+    }
+
+    /// Whether the USB task is inside a device session and will answer
+    /// `Disconnect` with `Disconnected`. Outside a session it ignores the
+    /// command, so waiting for an answer would only delay quitting.
+    fn usb_session_active(&self) -> bool {
+        self.streaming || self.device_state.is_some() || self.phase == ConnectionPhase::Connecting
+    }
+
+    /// Blocks until the USB task reports that the device was released, the
+    /// task ends, or `timeout` passes. Returns whether the task confirmed.
+    /// Only for quitting: every other message is dropped unprocessed.
+    fn wait_for_usb_shutdown(&mut self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            match self.usb_receiver.try_recv() {
+                Ok(UsbMessage::Disconnected | UsbMessage::ConnectionFailed(_))
+                | Err(mpsc::error::TryRecvError::Disconnected) => return true,
+                Ok(_) => {}
+                Err(mpsc::error::TryRecvError::Empty) => {
+                    if Instant::now() >= deadline {
+                        return false;
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
             }
         }
     }
@@ -10075,7 +10106,16 @@ impl eframe::App for PowerMonitorApp {
         // here makes Finder/Command-Q exits flush the 23-column contract.
         self.stop_recording();
         if !self.demo_mode {
-            let _ = self.cmd_sender.send(UsbCommand::Disconnect);
+            // The process exits right after this returns. Give the USB task a
+            // bounded moment to send StopGraph and close the interface, so the
+            // meter is not left streaming and no transfer is still in flight
+            // while AppKit tears the process down.
+            if self.cmd_sender.send(UsbCommand::Disconnect).is_ok()
+                && self.usb_session_active()
+                && !self.wait_for_usb_shutdown(USB_SHUTDOWN_TIMEOUT)
+            {
+                warn!("USB task did not release the device within {USB_SHUTDOWN_TIMEOUT:?}; quitting anyway");
+            }
         }
     }
 }
@@ -10334,6 +10374,9 @@ async fn run_streaming_session(
     // Stop streaming and disconnect
     info!("Stopping streaming");
     let _ = device.stop_graph_mode().await;
+    // Release the interface before reporting: a quitting app waits for this
+    // message and must not exit with the USB handle still open.
+    drop(device);
     let _ = tx.send(UsbMessage::Disconnected);
 }
 
@@ -11414,6 +11457,65 @@ mod tests {
             i18n::connection_guidance(Language::English, ConnectionPhase::DeviceBusy, Some("resource busy")).unwrap();
         assert!(guidance.contains("Close other POWER-Z"));
         assert!(i18n::connection_guidance(Language::English, ConnectionPhase::Streaming, None).is_none());
+    }
+
+    #[test]
+    fn quitting_waits_until_the_usb_task_releases_the_device() {
+        let (usb_tx, usb_rx) = mpsc::unbounded_channel();
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+        let mut app = PowerMonitorApp::new(usb_rx, cmd_tx);
+        app.streaming = true;
+        app.phase = ConnectionPhase::Streaming;
+        let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let usb_task = {
+            let released = Arc::clone(&released);
+            std::thread::spawn(move || {
+                while let Some(command) = cmd_rx.blocking_recv() {
+                    if matches!(command, UsbCommand::Disconnect) {
+                        break;
+                    }
+                }
+                // StopGraph and interface release take a moment; late
+                // samples may still be queued ahead of the confirmation.
+                std::thread::sleep(Duration::from_millis(50));
+                let _ = usb_tx.send(UsbMessage::Samples(Vec::new()));
+                released.store(true, std::sync::atomic::Ordering::SeqCst);
+                let _ = usb_tx.send(UsbMessage::Disconnected);
+            })
+        };
+
+        eframe::App::on_exit(&mut app);
+
+        assert!(
+            released.load(std::sync::atomic::Ordering::SeqCst),
+            "on_exit returned before the USB task released the device"
+        );
+        usb_task.join().unwrap();
+    }
+
+    #[test]
+    fn quitting_without_a_device_session_does_not_wait() {
+        let (_usb_tx, usb_rx) = mpsc::unbounded_channel();
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+        let mut app = PowerMonitorApp::new(usb_rx, cmd_tx);
+        app.phase = ConnectionPhase::NoDevice;
+
+        let started = Instant::now();
+        eframe::App::on_exit(&mut app);
+
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert!(matches!(cmd_rx.try_recv(), Ok(UsbCommand::Disconnect)));
+    }
+
+    #[test]
+    fn usb_shutdown_wait_is_bounded_when_the_task_never_answers() {
+        let (_usb_tx, usb_rx) = mpsc::unbounded_channel();
+        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
+        let mut app = PowerMonitorApp::new(usb_rx, cmd_tx);
+
+        let started = Instant::now();
+        assert!(!app.wait_for_usb_shutdown(Duration::from_millis(30)));
+        assert!(started.elapsed() >= Duration::from_millis(30));
     }
 
     #[test]
