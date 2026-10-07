@@ -1660,6 +1660,7 @@ impl PowerMonitorApp {
         {
             app.apply_preferences(prefs);
         }
+        theme::install_fonts(&cc.egui_ctx);
         theme::apply(&cc.egui_ctx, app.skin);
         app.load_skin_assets(&cc.egui_ctx);
         if demo_mode {
