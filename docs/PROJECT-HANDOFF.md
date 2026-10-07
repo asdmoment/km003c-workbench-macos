@@ -139,6 +139,8 @@ python3 -m unittest discover -s Scripts -p test_release_version.py
 
 `build_release.sh` 依次执行 `package_app.sh`、`make_dmg.sh`、`verify_dmg.sh`。构建需要 Rust（当前 Cargo 声明最低 1.97）、Xcode 命令行工具以及两个 macOS Rust target。产物在 `dist/`。本机快速验证可用 `ARCHS=arm64 ./Scripts/build_release.sh`，只编 Apple Silicon，DMG 名以 `-macOS-arm64.dmg` 结尾，不能当作 Universal 发布包。
 
+DMG 的创建与挂载经 `Scripts/disk_image.sh`：macOS 26 起 `hdiutil create` / `attach` 已弃用，有 `diskutil image` 时改用它，较早的系统与 CI runner 自动回退 `hdiutil`；`hdiutil verify` 未弃用，两条路径都用它校验。`DISK_IMAGE_TOOL=hdiutil` 可在新系统上强制走回退路径。
+
 App 版本、构建号、Bundle ID 和最低系统版本只在 `Distribution/Info.plist` 维护：打包脚本经 `Scripts/app_version.sh` 读取它并生成 DMG 文件名，`verify_dmg.sh` 校验包内 plist 与之一致，`i18n.rs` 的关于页常量由单元测试比对。发布标签同样从这里校验，支持 `v0.1.0`、`v0.1.0-YYYYMMDD` 和同日构建序号 `v0.1.0-YYYYMMDD-N`。不能拿 workspace 的 `0.3.0` 校验应用标签。
 
 GitHub Release workflow 在 macOS 上调用同一个 `build_release.sh`，产出 ad-hoc 签名的 Universal DMG 并挂载校验；Linux 与 Windows 仍为二进制压缩包。标签触发时生成草稿 Release；手动触发只验证、不发布。

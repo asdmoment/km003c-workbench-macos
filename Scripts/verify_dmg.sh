@@ -4,12 +4,14 @@ set -euo pipefail
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=Scripts/app_version.sh
 source "$ROOT_DIR/Scripts/app_version.sh"
+# shellcheck source=Scripts/disk_image.sh
+source "$ROOT_DIR/Scripts/disk_image.sh"
 DIST_DIR="${DIST_DIR:-$ROOT_DIR/dist}"
 DMG_PATH="${1:-$DIST_DIR/$DMG_NAME}"
 MOUNT_POINT="$(mktemp -d "${TMPDIR:-/tmp}/km003c-dmg.XXXXXX")"
 
 cleanup() {
-  hdiutil detach "$MOUNT_POINT" -quiet >/dev/null 2>&1 || true
+  dmg_detach "$MOUNT_POINT"
   rmdir "$MOUNT_POINT" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
@@ -20,7 +22,7 @@ EXPECTED="$(shasum -a 256 "$DMG_PATH" | awk '{print $1}')"
 if [[ -f "$DMG_PATH.sha256" ]]; then
   printf '%s  %s\n' "$EXPECTED" "$(basename "$DMG_PATH")" | diff -u "$DMG_PATH.sha256" -
 fi
-hdiutil attach -nobrowse -readonly -mountpoint "$MOUNT_POINT" "$DMG_PATH" >/dev/null
+dmg_attach_readonly "$DMG_PATH" "$MOUNT_POINT"
 
 APP="$MOUNT_POINT/$APP_NAME"
 APP_PLIST="$APP/Contents/Info.plist"
