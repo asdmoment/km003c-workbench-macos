@@ -69,7 +69,10 @@ d60b87cac14e246445c6c7f630e74fee252379a5ad53e871b6760750e60a1d87
 | --- | --- |
 | `km003c-lib/` | USB 通信、设备协议、PD 底层解码 |
 | `km003c-cli/` | 命令行工具 |
-| `km003c-egui/src/main.rs` | App 状态、USB 任务、录制协调、图表、设置、快捷键；仍是较大文件 |
+| `km003c-egui/src/main.rs` | App 状态、录制协调、图表、设置、快捷键；仍是较大文件 |
+| `usb_task.rs` | USB 会话任务：连接、AdcQueue 采样、PD 事件、固件 trace、停滞检测与重启、`UsbCommand`/`UsbMessage` |
+| `single_instance.rs` | 按 bundle id 的单实例锁（`flock`），第二次启动只唤醒已运行的窗口 |
+| `logging.rs` | `session.log` 初始化、启动时超过 4 MiB 轮转为 `session.log.1`、panic 写入日志（含线程与 backtrace） |
 | `measurement.rs` | 设备序号连续性、缺失统计、梯形积分、有符号与绝对累计量 |
 | `recording.rs` | 后台写盘、23 列数据、写盘事件与汇总 |
 | `recording_session.rs` | manifest、分段合并、北京时间元数据、恢复发现 |
