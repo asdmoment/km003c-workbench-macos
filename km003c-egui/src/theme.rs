@@ -198,50 +198,107 @@ pub(crate) fn apply(ctx: &egui::Context, skin: SkinId) {
     });
 }
 
-/// Installs system fonts for the UI languages, Simplified Chinese first and
-/// Latin as fallback, without bundling a font or changing licensing.
+/// Installs the system Chinese font next to egui's own faces, without
+/// bundling a font or changing licensing.
+///
+/// - Proportional text starts with the Chinese system face. PingFang carries
+///   Latin glyphs as well and is what native macOS UI draws Chinese text with.
+/// - Monospace text keeps egui's Hack first, so every digit of an instrument
+///   readout shares one advance; Chinese characters fall back to the system
+///   face at the end of the stack. A proportional face in front of Hack made
+///   readings shift sideways as their digits changed.
+///
+/// - The arrows, box-drawing marks, ● and Ⅱ used in labels and chart
+///   legends exist in neither PingFang's UI face nor egui's Ubuntu-Light, so
+///   proportional text falls back to egui's Hack before the emoji faces;
+///   that also keeps ▶ and ● in text rather than emoji presentation.
 ///
 /// Fonts never depend on the skin, so this runs once at startup instead of
-/// on every skin change: each installation maps or reads tens of megabytes
-/// of font files, and egui compares replaced font definitions byte by byte.
+/// on every skin change: egui compares replaced font definitions byte by byte.
 pub(crate) fn install_fonts(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    add_symbol_fallback(&mut fonts);
     #[cfg(target_os = "macos")]
     {
-        egui_system_fonts::set_with_presets(
-            ctx,
-            [egui_system_fonts::FontPreset::Latin],
-            egui_system_fonts::FontStyle::Sans,
-        );
-        match macos_fonts::simplified_chinese() {
-            Some(font) => ctx.add_font(font),
+        let mut chinese = macos_fonts::simplified_chinese().into_iter();
+        match chinese.next() {
+            Some((primary, data)) => {
+                fonts.font_data.insert(primary.clone(), std::sync::Arc::new(data));
+                fonts
+                    .families
+                    .entry(egui::FontFamily::Proportional)
+                    .or_default()
+                    .insert(0, primary.clone());
+                fonts
+                    .families
+                    .entry(egui::FontFamily::Monospace)
+                    .or_default()
+                    .push(primary);
+            }
             None => tracing::warn!("No Simplified Chinese system font found; Chinese labels cannot be drawn"),
         }
+        // A fuller GB face for what the primary face leaves out: PingFang's
+        // UI face on macOS 26+ lacks Ⅱ and rarer characters.
+        for (fallback, data) in chinese {
+            fonts.font_data.insert(fallback.clone(), std::sync::Arc::new(data));
+            insert_before_emoji(
+                fonts.families.entry(egui::FontFamily::Proportional).or_default(),
+                &fallback,
+            );
+            fonts
+                .families
+                .entry(egui::FontFamily::Monospace)
+                .or_default()
+                .push(fallback);
+        }
     }
-    #[cfg(not(target_os = "macos"))]
-    let _ = ctx;
+    ctx.set_fonts(fonts);
 }
 
-/// Locates the macOS Simplified Chinese system font.
+/// Puts egui's monospace face into the proportional stack, ahead of the
+/// emoji faces, as the fallback for symbols the text faces lack.
+fn add_symbol_fallback(fonts: &mut egui::FontDefinitions) {
+    const SYMBOL_FACE: &str = "Hack";
+    if fonts.font_data.contains_key(SYMBOL_FACE) {
+        insert_before_emoji(
+            fonts.families.entry(egui::FontFamily::Proportional).or_default(),
+            SYMBOL_FACE,
+        );
+    }
+}
+
+/// Appends `face` to a fallback chain, but ahead of the emoji faces, so
+/// characters with a text glyph do not get emoji presentation.
+fn insert_before_emoji(chain: &mut Vec<String>, face: &str) {
+    if chain.iter().any(|name| name == face) {
+        return;
+    }
+    let before_emoji = chain
+        .iter()
+        .position(|name| name.to_ascii_lowercase().contains("emoji"))
+        .unwrap_or(chain.len());
+    chain.insert(before_emoji, face.to_owned());
+}
+
+/// Locates a macOS Simplified Chinese system font that egui can draw.
 ///
-/// egui-system-fonts asks fontdb for "PingFang SC", but PingFang has moved
-/// twice: out of /System/Library/Fonts into a downloadable MobileAsset
-/// (macOS 10.15–15), then into FontServices' reserved directory (macOS 26+),
-/// which no generic font scanner searches. On those releases the Chinese UI
-/// had no glyphs at all. CoreText still resolves "PingFang SC" to that file,
-/// and Hiragino Sans GB and Heiti SC remain in /System/Library/Fonts.
+/// PingFang left /System/Library/Fonts for a downloadable MobileAsset
+/// (macOS 10.15–15). On macOS 26 and later the only PingFang left is
+/// FontServices' reserved `PingFangUI.ttc`, whose outlines use a format only
+/// CoreText reads: egui measures its glyphs and draws nothing, which blanks
+/// every proportional label. A face is therefore used only if it carries
+/// TrueType or PostScript outlines; Hiragino Sans GB and Heiti SC, which ship
+/// in /System/Library/Fonts, cover the releases without a drawable PingFang.
 #[cfg(target_os = "macos")]
 mod macos_fonts {
     use std::path::{Path, PathBuf};
 
-    use eframe::egui::{FontData, FontFamily};
-    use eframe::epaint::text::{FontInsert, FontPriority, InsertFontFamily};
+    use eframe::egui::FontData;
 
     /// Families in order of preference: the system face first, then faces
     /// that have shipped in /System/Library/Fonts for many releases.
     pub(super) const FAMILIES: [&str; 3] = ["PingFang SC", "Hiragino Sans GB", "Heiti SC"];
 
-    const RESERVED_PINGFANG: &str =
-        "/System/Library/PrivateFrameworks/FontServices.framework/Resources/Reserved/PingFangUI.ttc";
     const SYSTEM_FONTS: [&str; 4] = [
         "/System/Library/Fonts/PingFang.ttc",
         "/System/Library/Fonts/Hiragino Sans GB.ttc",
@@ -253,11 +310,20 @@ mod macos_fonts {
     /// Existing files that may contain one of [`FAMILIES`]. Listing a few
     /// known locations is far cheaper than scanning every installed font.
     pub(super) fn candidate_files() -> Vec<PathBuf> {
-        let mut files = vec![PathBuf::from(RESERVED_PINGFANG)];
-        files.extend(downloadable_pingfang());
+        let mut files = downloadable_pingfang();
         files.extend(SYSTEM_FONTS.iter().map(PathBuf::from));
         files.retain(|path| path.is_file());
         files
+    }
+
+    /// Whether the face has outlines egui can rasterise: TrueType (`glyf`)
+    /// or PostScript (`CFF `, `CFF2`).
+    pub(super) fn has_drawable_outlines(data: &[u8], index: u32) -> bool {
+        ttf_parser::RawFace::parse(data, index).is_ok_and(|face| {
+            [b"glyf", b"CFF ", b"CFF2"]
+                .iter()
+                .any(|tag| face.table(ttf_parser::Tag::from_bytes(tag)).is_some())
+        })
     }
 
     /// PingFang delivered as a MobileAsset:
@@ -284,43 +350,38 @@ mod macos_fonts {
             .collect()
     }
 
-    /// The preferred available face as an egui font that takes precedence
-    /// over the Latin fallback, like PingFang SC does in native macOS UI.
-    pub(crate) fn simplified_chinese() -> Option<FontInsert> {
+    /// Up to two available faces in [`FAMILIES`] order, named for egui's
+    /// font definitions: the primary face and a fuller fallback.
+    pub(crate) fn simplified_chinese() -> Vec<(String, FontData)> {
         let mut database = fontdb::Database::new();
         for file in candidate_files() {
             if let Err(error) = database.load_font_file(&file) {
                 tracing::debug!("Skipping font {}: {error}", file.display());
             }
         }
-        FAMILIES.iter().find_map(|&family| {
-            let id = database.query(&fontdb::Query {
-                families: &[fontdb::Family::Name(family)],
-                ..fontdb::Query::default()
-            })?;
-            let (source, index) = database.face_source(id)?;
-            let path = match source {
-                fontdb::Source::File(path) | fontdb::Source::SharedFile(path, _) => path,
-                fontdb::Source::Binary(_) => return None,
-            };
-            let mut data = FontData::from_static(map_font_file(&path)?);
-            data.index = index;
-            tracing::info!(family, path = %path.display(), index, "Using Chinese system font");
-            Some(FontInsert::new(
-                &format!("macos-system:{family}"),
-                data,
-                vec![
-                    InsertFontFamily {
-                        family: FontFamily::Proportional,
-                        priority: FontPriority::Highest,
-                    },
-                    InsertFontFamily {
-                        family: FontFamily::Monospace,
-                        priority: FontPriority::Highest,
-                    },
-                ],
-            ))
-        })
+        FAMILIES
+            .iter()
+            .filter_map(|&family| {
+                let id = database.query(&fontdb::Query {
+                    families: &[fontdb::Family::Name(family)],
+                    ..fontdb::Query::default()
+                })?;
+                if !database.with_face_data(id, has_drawable_outlines)? {
+                    tracing::info!(family, "Skipping Chinese font without drawable outlines");
+                    return None;
+                }
+                let (source, index) = database.face_source(id)?;
+                let path = match source {
+                    fontdb::Source::File(path) | fontdb::Source::SharedFile(path, _) => path,
+                    fontdb::Source::Binary(_) => return None,
+                };
+                let mut data = FontData::from_static(map_font_file(&path)?);
+                data.index = index;
+                tracing::info!(family, path = %path.display(), index, "Using Chinese system font");
+                Some((format!("macos-system:{family}"), data))
+            })
+            .take(2)
+            .collect()
     }
 
     /// Maps a font collection instead of copying it to the heap. PingFang is
@@ -346,11 +407,20 @@ mod tests {
     /// Labels the workbench shows in its default Simplified Chinese UI.
     const CHINESE_SAMPLE: &str = "工作台电压电流功率录制设置";
 
-    /// Whether the `font_id` stack can draw every glyph in `text`.
-    fn renders(ctx: &egui::Context, font_id: &egui::FontId, text: &str) -> bool {
+    /// The characters of `text` that the `font_id` stack cannot draw.
+    ///
+    /// `has_glyph` is not used: egui answers it by comparing the owning face
+    /// with the face holding the replacement character, so every character of
+    /// that face (Hack, for monospace) reads as missing. A missing character
+    /// resolves to the replacement face without a glyph and has zero width.
+    fn missing_glyphs(ctx: &egui::Context, font_id: &egui::FontId, text: &str) -> String {
         // Pending font changes are applied at the start of the next pass.
         let _ = ctx.run_ui(egui::RawInput::default(), |_| {});
-        ctx.fonts_mut(|fonts| fonts.has_glyphs(font_id, text))
+        ctx.fonts_mut(|fonts| {
+            text.chars()
+                .filter(|&c| c != ' ' && fonts.glyph_width(font_id, c) <= 0.0)
+                .collect()
+        })
     }
 
     /// "A font was found" is not enough: on macOS 26+ the resolver found only
@@ -361,12 +431,68 @@ mod tests {
         install_fonts(&ctx);
         apply(&ctx, SkinId::Industrial);
         for font_id in [egui::FontId::proportional(13.0), egui::FontId::monospace(13.0)] {
-            assert!(
-                renders(&ctx, &font_id, CHINESE_SAMPLE),
-                "no installed {font_id:?} font covers the default Chinese UI labels"
-            );
-            assert!(renders(&ctx, &font_id, "Voltage 12.345 V · 1.234 A"));
+            for text in [CHINESE_SAMPLE, "Voltage 12.345 V · 1.234 A"] {
+                let missing = missing_glyphs(&ctx, &font_id, text);
+                assert!(missing.is_empty(), "{font_id:?} has no glyph for: {missing}");
+            }
         }
+    }
+
+    /// Every non-ASCII character the UI sources can show (comment lines
+    /// skipped) must have a glyph in both stacks: symbols such as µ, ·, ●, ○
+    /// or arrows have no Latin system font to fall back on any more.
+    #[test]
+    fn every_ui_character_has_a_glyph() {
+        const SOURCES: [&str; 9] = [
+            include_str!("main.rs"),
+            include_str!("i18n.rs"),
+            include_str!("preferences.rs"),
+            include_str!("measurement.rs"),
+            include_str!("chart_view.rs"),
+            include_str!("pd_decoder.rs"),
+            include_str!("pd_trace_view.rs"),
+            include_str!("offline_view.rs"),
+            include_str!("recording_session.rs"),
+        ];
+        let mut characters: Vec<char> = SOURCES
+            .iter()
+            .flat_map(|source| source.lines())
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .flat_map(str::chars)
+            .filter(|character| !character.is_ascii())
+            .collect();
+        characters.sort_unstable();
+        characters.dedup();
+
+        let ctx = egui::Context::default();
+        install_fonts(&ctx);
+        let _ = ctx.run_ui(egui::RawInput::default(), |_| {});
+        let text: String = characters.into_iter().collect();
+        for font_id in [egui::FontId::proportional(13.0), egui::FontId::monospace(13.0)] {
+            let missing = missing_glyphs(&ctx, &font_id, &text);
+            assert!(missing.is_empty(), "{font_id:?} has no glyph for: {missing}");
+        }
+    }
+
+    /// Instrument readouts use the monospace style. Every character a reading
+    /// can contain must share one advance, or a changing value shifts sideways.
+    #[test]
+    fn monospace_readout_characters_share_one_advance() {
+        let ctx = egui::Context::default();
+        install_fonts(&ctx);
+        let _ = ctx.run_ui(egui::RawInput::default(), |_| {});
+        let font_id = egui::FontId::monospace(34.0);
+        let widths: Vec<(char, f32)> = ctx.fonts_mut(|fonts| {
+            "0123456789.-+ "
+                .chars()
+                .map(|c| (c, fonts.glyph_width(&font_id, c)))
+                .collect()
+        });
+        let first = widths[0].1;
+        assert!(
+            widths.iter().all(|(_, width)| (width - first).abs() < 0.01),
+            "monospace advances differ: {widths:?}"
+        );
     }
 
     #[test]
@@ -375,24 +501,51 @@ mod tests {
         install_fonts(&ctx);
         apply(&ctx, SkinId::Industrial);
         let font_id = egui::FontId::proportional(13.0);
-        assert!(renders(&ctx, &font_id, CHINESE_SAMPLE));
+        assert_eq!(missing_glyphs(&ctx, &font_id, CHINESE_SAMPLE), "");
         apply(&ctx, SkinId::CleanAnime);
-        assert!(renders(&ctx, &font_id, CHINESE_SAMPLE));
+        assert_eq!(missing_glyphs(&ctx, &font_id, CHINESE_SAMPLE), "");
     }
 
-    /// PingFang is the native face whenever its file exists, including the
-    /// reserved FontServices location used since macOS 26.
+    /// Faces come in preference order, and a primary plus a fallback are
+    /// always available: Hiragino Sans GB and Heiti SC ship with macOS.
     #[test]
-    fn pingfang_is_preferred_when_installed() {
-        let pingfang_installed = macos_fonts::candidate_files().iter().any(|path| {
-            path.file_name()
-                .is_some_and(|name| name.to_string_lossy().starts_with("PingFang"))
-        });
-        let font = macos_fonts::simplified_chinese().expect("a Simplified Chinese system font");
-        if pingfang_installed {
-            assert_eq!(font.name, "macos-system:PingFang SC");
-        } else {
-            assert!(macos_fonts::FAMILIES.iter().any(|family| font.name.ends_with(family)));
+    fn chinese_faces_follow_the_preference_order() {
+        let names: Vec<String> = macos_fonts::simplified_chinese()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(names.len(), 2, "expected a primary and a fallback face, got {names:?}");
+        let rank = |name: &String| {
+            macos_fonts::FAMILIES
+                .iter()
+                .position(|family| name.ends_with(family))
+                .expect("a known family")
+        };
+        assert!(rank(&names[0]) < rank(&names[1]), "faces out of order: {names:?}");
+    }
+
+    /// Measuring is not drawing: PingFang's UI face on macOS 26+ reported
+    /// glyph widths yet produced no pixels, blanking every proportional label.
+    /// Every glyph of real labels must reach the font atlas.
+    #[test]
+    fn chinese_latin_and_symbol_labels_rasterize() {
+        let ctx = egui::Context::default();
+        install_fonts(&ctx);
+        let _ = ctx.run_ui(egui::RawInput::default(), |_| {});
+        let text = format!("{CHINESE_SAMPLE} Voltage 12.345 V · ● Ⅱ ↓ ┄");
+        for font_id in [egui::FontId::proportional(13.0), egui::FontId::monospace(13.0)] {
+            let galley =
+                ctx.fonts_mut(|fonts| fonts.layout_no_wrap(text.clone(), font_id.clone(), egui::Color32::WHITE));
+            let blank: String = galley
+                .rows
+                .iter()
+                .flat_map(|row| row.row.glyphs.iter())
+                .filter(|glyph| {
+                    !glyph.chr.is_whitespace() && (glyph.uv_rect.size.x <= 0.0 || glyph.uv_rect.size.y <= 0.0)
+                })
+                .map(|glyph| glyph.chr)
+                .collect();
+            assert!(blank.is_empty(), "{font_id:?} drew nothing for: {blank}");
         }
     }
 
