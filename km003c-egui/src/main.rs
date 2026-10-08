@@ -1112,17 +1112,37 @@ fn apply_recording_offsets(mut sample: MeasurementSample, offsets: RecordingOffs
     sample
 }
 
+/// Storage identity of this process: [`APP_ID`], [`DEMO_APP_ID`] in demo mode,
+/// or `KM003C_NATIVE_APP_ID`. Set once in `main`; unset (tests) means
+/// [`APP_ID`].
+static RUNTIME_APP_ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
 fn application_recordings_directory() -> PathBuf {
-    if let Some(storage_root) = std::env::var_os("KM003C_STORAGE_ROOT") {
+    recordings_directory_for(
+        RUNTIME_APP_ID.get().map_or(APP_ID, String::as_str),
+        std::env::var_os("KM003C_STORAGE_ROOT"),
+        std::env::var_os("HOME"),
+    )
+}
+
+/// Recordings live with the preferences and logs of the running app id, so
+/// a demo session neither writes into the real app's pending recordings nor
+/// offers to recover or delete them.
+fn recordings_directory_for(
+    app_id: &str,
+    storage_root: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> PathBuf {
+    if let Some(storage_root) = storage_root {
         return PathBuf::from(storage_root).join("Recordings");
     }
-    std::env::var_os("HOME").map_or_else(
-        || std::env::temp_dir().join(APP_ID).join("Recordings"),
+    home.map_or_else(
+        || std::env::temp_dir().join(app_id).join("Recordings"),
         |home| {
             PathBuf::from(home)
                 .join("Library")
                 .join("Application Support")
-                .join(APP_ID)
+                .join(app_id)
                 .join("Recordings")
         },
     )
@@ -9157,6 +9177,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let demo_mode = std::env::args().any(|arg| arg == "--demo");
     let runtime_app_id =
         std::env::var("KM003C_NATIVE_APP_ID").unwrap_or_else(|_| default_runtime_app_id(demo_mode).to_string());
+    let _ = RUNTIME_APP_ID.set(runtime_app_id.clone());
     let runtime_title =
         std::env::var("KM003C_WINDOW_TITLE").unwrap_or_else(|_| default_runtime_title(demo_mode).to_string());
     let Some(single_instance_guard) = SingleInstanceGuard::acquire(&runtime_app_id)? else {
@@ -10324,6 +10345,27 @@ mod tests {
         assert_eq!(default_runtime_app_id(true), DEMO_APP_ID);
         assert_ne!(default_runtime_app_id(false), default_runtime_app_id(true));
         assert!(default_runtime_title(true).contains("演示模式"));
+    }
+
+    #[test]
+    fn demo_recordings_stay_out_of_the_real_app_storage() {
+        let home = || Some(std::ffi::OsString::from("/Users/someone"));
+        let real = recordings_directory_for(APP_ID, None, home());
+        let demo = recordings_directory_for(DEMO_APP_ID, None, home());
+        assert_eq!(
+            real,
+            Path::new("/Users/someone/Library/Application Support/com.weixun.km003cworkbench/Recordings")
+        );
+        assert!(
+            !demo.starts_with(real.parent().unwrap()),
+            "demo recordings must not land in, or be recovered from, {}",
+            real.display()
+        );
+        assert_eq!(
+            recordings_directory_for(DEMO_APP_ID, Some("/tmp/km003c-root".into()), home()),
+            Path::new("/tmp/km003c-root/Recordings"),
+            "KM003C_STORAGE_ROOT still decides for every app id"
+        );
     }
 
     #[test]
