@@ -222,7 +222,17 @@ pub(crate) fn install_fonts(ctx: &egui::Context) {
     {
         let mut chinese = macos_fonts::simplified_chinese().into_iter();
         match chinese.next() {
-            Some((primary, data)) => {
+            Some((primary, mut data)) => {
+                // Glyphs the Chinese face lacks are drawn by egui's own faces;
+                // put the Chinese face on their baseline.
+                if let Some(reference) = fonts
+                    .families
+                    .get(&egui::FontFamily::Proportional)
+                    .and_then(|chain| chain.first())
+                    .and_then(|name| fonts.font_data.get(name))
+                {
+                    data.tweak.y_offset_factor += macos_fonts::baseline_shift(&data, reference);
+                }
                 fonts.font_data.insert(primary.clone(), std::sync::Arc::new(data));
                 fonts
                     .families
@@ -237,8 +247,7 @@ pub(crate) fn install_fonts(ctx: &egui::Context) {
             }
             None => tracing::warn!("No Simplified Chinese system font found; Chinese labels cannot be drawn"),
         }
-        // A fuller GB face for what the primary face leaves out: PingFang's
-        // UI face on macOS 26+ lacks Ⅱ and rarer characters.
+        // A second Chinese face for characters the first one lacks.
         for (fallback, data) in chinese {
             fonts.font_data.insert(fallback.clone(), std::sync::Arc::new(data));
             insert_before_emoji(
@@ -314,6 +323,53 @@ mod macos_fonts {
         files.extend(SYSTEM_FONTS.iter().map(PathBuf::from));
         files.retain(|path| path.is_file());
         files
+    }
+
+    /// How far, as a fraction of the font size, epaint draws a fallback face's
+    /// baseline below that of the `chinese` face leading the stack, for a
+    /// fallback with the line box of `reference`.
+    ///
+    /// epaint centres each fallback face's line box inside the leading face's
+    /// (`text_layout.rs`: `pos.y = face ascent + ½(row height − face row
+    /// height)`). Hiragino Sans GB has a 0.5 em line gap, so every glyph it
+    /// lacks (µ, − and ▶ in this UI) came out about 0.23 em low and "D−"
+    /// read as "D_". egui's faces, Hack and Heiti SC have nearly the same
+    /// line box, so moving the Chinese face down by this amount puts it on
+    /// their shared baseline. That holds in the proportional stack, which it
+    /// leads, and in the monospace stack, where it trails Hack and sat as far
+    /// too high; it also centres Chinese text in its tall rows. A FontTweak
+    /// offset moves the drawn glyphs only, not the layout.
+    pub(super) fn baseline_shift(chinese: &FontData, reference: &FontData) -> f32 {
+        match (LineBox::of(chinese), LineBox::of(reference)) {
+            (Some(chinese), Some(reference)) => {
+                reference.ascent + 0.5 * (chinese.height() - reference.height()) - chinese.ascent
+            }
+            _ => 0.0,
+        }
+    }
+
+    /// Vertical line metrics in ems, chosen as skrifa (and so epaint) does:
+    /// OS/2 typographic metrics when the face asks for them, else `hhea`.
+    struct LineBox {
+        ascent: f32,
+        descent: f32,
+        line_gap: f32,
+    }
+
+    impl LineBox {
+        fn of(data: &FontData) -> Option<Self> {
+            let face = ttf_parser::Face::parse(&data.font, data.index).ok()?;
+            let em = f32::from(face.units_per_em());
+            Some(Self {
+                ascent: f32::from(face.ascender()) / em,
+                descent: f32::from(face.descender()) / em,
+                line_gap: f32::from(face.line_gap()) / em,
+            })
+        }
+
+        fn height(&self) -> f32 {
+            self.ascent - self.descent + self.line_gap
+        }
     }
 
     /// Whether the face has outlines egui can rasterise: TrueType (`glyf`)
@@ -546,6 +602,54 @@ mod tests {
                 .map(|glyph| glyph.chr)
                 .collect();
             assert!(blank.is_empty(), "{font_id:?} drew nothing for: {blank}");
+        }
+    }
+
+    /// Characters the Chinese face lacks come from fallback faces; they and
+    /// the Chinese glyphs must share one baseline in both stacks. Hiragino
+    /// Sans GB's line gap once dropped the fallbacks about 0.23 em, so the
+    /// minus of "D−" sat on the baseline and the label read "D_", while
+    /// Chinese text in the monospace stack sat as far too high.
+    #[test]
+    fn fallback_symbols_and_chinese_share_the_text_baseline() {
+        let ctx = egui::Context::default();
+        install_fonts(&ctx);
+        let _ = ctx.run_ui(egui::RawInput::default(), |_| {});
+        for font_id in [
+            egui::FontId::proportional(13.0),
+            egui::FontId::proportional(34.0),
+            egui::FontId::monospace(13.0),
+            egui::FontId::monospace(34.0),
+        ] {
+            let size = font_id.size;
+            let galley =
+                ctx.fonts_mut(|fonts| fonts.layout_no_wrap("D−▶电".to_owned(), font_id.clone(), egui::Color32::WHITE));
+            let drawn = |chr: char| {
+                let glyph = galley.rows[0].row.glyphs.iter().find(|glyph| glyph.chr == chr).unwrap();
+                let top = glyph.pos.y + glyph.uv_rect.offset.y;
+                (top, top + glyph.uv_rect.size.y)
+            };
+            // Pixel snapping moves glyphs by up to a pixel.
+            let tolerance = 0.1 * size + 0.5;
+            let (capital_top, baseline) = drawn('D');
+            let quarter = (baseline - capital_top) / 4.0;
+            let (top, bottom) = drawn('−');
+            assert!(
+                (capital_top + quarter..=baseline - quarter).contains(&((top + bottom) / 2.0)),
+                "{font_id:?}: − is drawn at {top}..{bottom}, D at {capital_top}..{baseline}"
+            );
+            let (top, bottom) = drawn('▶');
+            assert!(
+                (bottom - baseline).abs() <= tolerance,
+                "{font_id:?}: ▶ is drawn at {top}..{bottom}, the baseline is {baseline}"
+            );
+            // An ideograph's design box runs from about -0.12 to 0.88 em.
+            let (top, bottom) = drawn('电');
+            let centre_above_baseline = (baseline - (top + bottom) / 2.0) / size;
+            assert!(
+                (0.28..=0.48).contains(&centre_above_baseline),
+                "{font_id:?}: 电 is drawn at {top}..{bottom}, the baseline is {baseline}"
+            );
         }
     }
 
