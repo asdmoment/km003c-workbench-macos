@@ -66,6 +66,14 @@ const MAX_USB_MESSAGES_PER_FRAME: usize = 64;
 /// while the application quits. A normal stop takes a few milliseconds.
 const USB_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(1500);
 
+/// `logic` cadence without a stream: connection retries, PD timeouts and the
+/// 0.1 s recording clock.
+const IDLE_REPAINT_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Every display frame. egui subtracts one predicted frame (1/60 s) from a
+/// requested delay, so 16 ms schedules the next frame immediately.
+const FRAME_REPAINT_INTERVAL: Duration = Duration::from_millis(16);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PlotSource {
     Live,
@@ -1206,6 +1214,21 @@ impl SampleRateOption {
             Self::Sps10 => 10,
             Self::Sps50 => 50,
             Self::Sps1000 => 1_000,
+        }
+    }
+
+    /// How often `logic` runs while this rate streams. The USB task never
+    /// wakes the UI, so this is also the longest a new sample waits before it
+    /// is processed and drawn. The values give roughly 10, 20 and 30 frames
+    /// per second for 2, 10 and 50 samples per second, and every display
+    /// frame at 1000: redrawing a 2 SPS chart on every frame paints each
+    /// sample 30 times (60 on a 120 Hz display) without changing a pixel.
+    const fn streaming_repaint_interval(self) -> Duration {
+        match self {
+            Self::Sps2 => IDLE_REPAINT_INTERVAL,
+            Self::Sps10 => Duration::from_millis(50),
+            Self::Sps50 => Duration::from_millis(33),
+            Self::Sps1000 => FRAME_REPAINT_INTERVAL,
         }
     }
 
@@ -4665,12 +4688,25 @@ impl PowerMonitorApp {
         self.finish_measurement_restart();
         self.update_demo_data();
         self.sync_streaming_activity();
+        match self.next_logic_delay(usb_backlog) {
+            Duration::ZERO => ctx.request_repaint(),
+            delay => ctx.request_repaint_after(delay),
+        }
+    }
+
+    /// Delay before `logic` runs again: at once while USB messages are queued
+    /// beyond one frame's budget, at the pace of the stream while sampling,
+    /// and at the idle cadence otherwise.
+    fn next_logic_delay(&self, usb_backlog: bool) -> Duration {
         if usb_backlog {
-            ctx.request_repaint();
-        } else if self.streaming {
-            ctx.request_repaint_after(Duration::from_millis(16));
+            Duration::ZERO
+        } else if !self.streaming {
+            IDLE_REPAINT_INTERVAL
+        } else if self.demo_mode {
+            // The demo generator emits at most one sample per pass.
+            FRAME_REPAINT_INTERVAL
         } else {
-            ctx.request_repaint_after(Duration::from_millis(100));
+            self.current_rate.streaming_repaint_interval()
         }
     }
 
@@ -10458,6 +10494,50 @@ mod tests {
             last.energy_throughput_uwh,
             last.charge_throughput_uah
         );
+    }
+
+    #[test]
+    fn logic_wakes_at_the_pace_of_the_stream() {
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
+        let mut app = PowerMonitorApp::new(rx, cmd_tx);
+        assert!(!app.demo_mode);
+
+        app.streaming = false;
+        assert_eq!(app.next_logic_delay(false), IDLE_REPAINT_INTERVAL);
+        assert_eq!(
+            app.next_logic_delay(true),
+            Duration::ZERO,
+            "a USB backlog is drained on the next pass"
+        );
+
+        app.streaming = true;
+        let mut slower = Duration::MAX;
+        for &rate in SampleRateOption::all() {
+            app.current_rate = rate;
+            let interval = app.next_logic_delay(false);
+            assert!(
+                interval <= IDLE_REPAINT_INTERVAL,
+                "{rate:?}: the 0.1 s recording clock keeps moving"
+            );
+            assert!(interval < slower, "{rate:?}: faster streams are drawn more often");
+            slower = interval;
+            assert_eq!(app.next_logic_delay(true), Duration::ZERO);
+        }
+        assert_eq!(
+            SampleRateOption::Sps1000.streaming_repaint_interval(),
+            FRAME_REPAINT_INTERVAL
+        );
+
+        app.demo_mode = true;
+        app.current_rate = SampleRateOption::Sps2;
+        assert_eq!(
+            app.next_logic_delay(false),
+            FRAME_REPAINT_INTERVAL,
+            "the demo generator advances once per pass"
+        );
+        app.streaming = false;
+        assert_eq!(app.next_logic_delay(false), IDLE_REPAINT_INTERVAL);
     }
 
     #[test]
