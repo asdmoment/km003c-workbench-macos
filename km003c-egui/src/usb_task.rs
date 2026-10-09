@@ -45,6 +45,8 @@ pub(crate) enum UsbMessage {
     StreamingStarted(GraphSampleRate),
     /// Streaming stopped
     StreamingStopped,
+    /// No samples arrived since this instant; recording must retain the interruption.
+    StreamingStalled(Instant),
     /// Error during streaming
     Error(String),
     /// Disconnected
@@ -278,6 +280,7 @@ async fn run_streaming_session(
                         "No AdcQueue samples for {:.1} s, restarting streaming",
                         last_samples.elapsed().as_secs_f32()
                     );
+                    let _ = tx.send(UsbMessage::StreamingStalled(last_samples));
                     if let Err(error) = restart_streaming(&mut device, current_rate, tx).await {
                         // The firmware can reject StartGraph as well after a
                         // long stall. Ending the session hands it to the

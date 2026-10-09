@@ -19,7 +19,7 @@ mod theme;
 mod usb_task;
 
 use chart_view::{ChartObservationMode, RangeMode, TraceRange};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use connection::ConnectionPhase;
 use eframe::egui;
 use egui_plot::{
@@ -1939,8 +1939,8 @@ impl PowerMonitorApp {
                         self.recording_status = self
                             .language
                             .pick(
-                                "USB 已重连 · 正在续录同一段记录",
-                                "USB reconnected · Continuing the same recording",
+                                "采样已恢复 · 正在续录同一段记录",
+                                "Sampling restored · Continuing the same recording",
                             )
                             .to_string();
                     }
@@ -2048,6 +2048,19 @@ impl PowerMonitorApp {
                     }
                     self.offline_status = format!("离线记录操作失败：{error}");
                 }
+                UsbMessage::StreamingStalled(last_samples) => {
+                    if self.recording_session && !self.recording_paused {
+                        let now = Utc::now();
+                        let started_at = chrono::Duration::from_std(last_samples.elapsed())
+                            .ok()
+                            .and_then(|duration| now.checked_sub_signed(duration))
+                            .unwrap_or(now);
+                        self.pause_recording_with_reason(PauseReason::UsbDisconnected, started_at);
+                        if self.recording_phase == RecordingPhase::Paused {
+                            self.recording_phase = RecordingPhase::Recovering;
+                        }
+                    }
+                }
                 UsbMessage::StreamingStopped => {
                     self.streaming = false;
                     if self.device_state.is_some() {
@@ -2079,7 +2092,7 @@ impl PowerMonitorApp {
                     self.pd_connection = PdConnectionTracker::default();
                     self.offline_busy = false;
                     if self.recording_session && !self.disconnect_requested {
-                        self.pause_recording_with_reason(PauseReason::UsbDisconnected);
+                        self.pause_recording_with_reason(PauseReason::UsbDisconnected, Utc::now());
                         self.recording_phase = RecordingPhase::WaitingForReconnect;
                         self.recording_status = self
                             .language
@@ -2201,17 +2214,17 @@ impl PowerMonitorApp {
     }
 
     fn pause_recording(&mut self) {
-        self.pause_recording_with_reason(PauseReason::Manual);
+        self.pause_recording_with_reason(PauseReason::Manual, Utc::now());
     }
 
-    fn pause_recording_with_reason(&mut self, reason: PauseReason) {
+    fn pause_recording_with_reason(&mut self, reason: PauseReason, started_at_utc: DateTime<Utc>) {
         if !self.recording_session || self.recording_paused {
             return;
         }
         if let Some(metadata) = &mut self.recording_session_metadata {
             let interval = RecordingTimeInterval {
                 reason: reason.interval_reason(),
-                started_at_utc: Utc::now(),
+                started_at_utc: started_at_utc.max(metadata.timestamps.started_at_utc),
                 ended_at_utc: None,
             };
             if reason == PauseReason::UsbDisconnected {
@@ -2850,7 +2863,7 @@ impl PowerMonitorApp {
                     }
                 }
                 if should_auto_pause {
-                    self.pause_recording_with_reason(PauseReason::Automatic(auto_rule.metric));
+                    self.pause_recording_with_reason(PauseReason::Automatic(auto_rule.metric), Utc::now());
                     self.recording_status = format!(
                         "{} · {} {:.1} s ≤ {:.3} {}",
                         self.language.pick("已自动暂停", "Auto-paused"),
@@ -3717,7 +3730,10 @@ impl PowerMonitorApp {
                         metadata.end_elapsed_us = summary.elapsed_us;
                         metadata.sealed = true;
                     }
-                    if let Some(metadata) = &mut self.recording_session_metadata {
+                    // Older segments may finish after a newer segment has already sealed.
+                    if let Some(metadata) = &mut self.recording_session_metadata
+                        && summary.rows >= metadata.rows
+                    {
                         metadata.update_from_summary(&summary);
                         metadata.refresh_durations(Utc::now());
                     }
@@ -3822,6 +3838,13 @@ impl PowerMonitorApp {
                     summary.completeness_percent(),
                     destination.display(),
                 );
+                if metadata.disconnected_duration_ms > 0 {
+                    self.recording_status.push_str(&format!(
+                        " · {} {}",
+                        self.language.pick("采集中断", "Capture interrupted"),
+                        format_recording_duration(Duration::from_millis(metadata.disconnected_duration_ms)),
+                    ));
+                }
                 self.recording_phase = RecordingPhase::Saved;
                 self.pending_save_destination = None;
                 self.finish_recording_session();
@@ -6332,6 +6355,26 @@ impl PowerMonitorApp {
                         )
                         .clicked();
                 });
+                if let Some(metadata) = self
+                    .imported_recording
+                    .as_ref()
+                    .filter(|_| self.plot_source == PlotSource::Imported)
+                    .and_then(|recording| recording.metadata.as_ref())
+                    && !metadata.disconnect_intervals.is_empty()
+                {
+                    ui.colored_label(
+                        theme::POWER,
+                        format!(
+                            "{} {} · {}",
+                            language.pick("采集中断", "Capture interrupted"),
+                            format_recording_duration(Duration::from_millis(metadata.disconnected_duration_ms)),
+                            language.pick(
+                                "完整度仅针对有效采样区间",
+                                "Completeness covers captured intervals only"
+                            ),
+                        ),
+                    );
+                }
             });
         ui.add_space(4.0);
         if close {
@@ -10580,6 +10623,119 @@ mod tests {
         );
         app.streaming = false;
         assert_eq!(app.next_logic_delay(false), IDLE_REPAINT_INTERVAL);
+    }
+
+    #[test]
+    fn stalled_stream_preserves_interruptions_and_manual_pause_when_saved() {
+        use km003c_lib::uom::si::{
+            electric_current::ampere,
+            f64::{ElectricCurrent, ElectricPotential},
+        };
+        for format in RecordingFormat::ALL {
+            for (manual_pause, restart_success) in [(false, true), (true, true), (false, false)] {
+                let (tx, rx) = mpsc::unbounded_channel();
+                let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
+                let mut app = PowerMonitorApp::new(rx, cmd_tx);
+                app.sleep_protection_enabled = false;
+                let root = std::env::temp_dir().join(format!(
+                    "km003c-stall-{}-{}",
+                    std::process::id(),
+                    Utc::now().timestamp_nanos_opt().unwrap()
+                ));
+                let directory = root.join("session");
+                std::fs::create_dir_all(directory.join("segments")).unwrap();
+                let metadata = RecordingSessionMetadataV1::new(
+                    Utc::now() - chrono::Duration::seconds(10),
+                    RecordingMetadata::default(),
+                    2,
+                );
+                app.recording_session_directory = Some(directory.clone());
+                app.recording_manifest = Some(RecordingSessionManifestV1::new(format, metadata.clone()));
+                app.recording_session_metadata = Some(metadata);
+                app.recording_session = true;
+                app.recording_phase = RecordingPhase::Recording;
+                app.start_next_recording_segment(None, RecordingOffsets::default())
+                    .unwrap();
+                let sample = |sequence| {
+                    let vbus = ElectricPotential::new::<volt>(10.0);
+                    let ibus = ElectricCurrent::new::<ampere>(2.0);
+                    AdcQueueSample {
+                        sequence,
+                        marker: 0,
+                        vbus,
+                        ibus,
+                        power: vbus * ibus,
+                        cc1: vbus,
+                        cc2: vbus,
+                        vdp: vbus,
+                        vdm: vbus,
+                    }
+                };
+                tx.send(UsbMessage::StreamingStarted(GraphSampleRate::Sps2)).unwrap();
+                tx.send(UsbMessage::Samples(vec![sample(0), sample(500)])).unwrap();
+                app.process_messages();
+                if manual_pause {
+                    app.pause_recording();
+                }
+                tx.send(UsbMessage::StreamingStalled(
+                    Instant::now() - Duration::from_millis(3500),
+                ))
+                .unwrap();
+                tx.send(UsbMessage::StreamingStopped).unwrap();
+                if restart_success {
+                    tx.send(UsbMessage::StreamingStarted(GraphSampleRate::Sps2)).unwrap();
+                    tx.send(UsbMessage::Samples(vec![sample(4000), sample(4500)])).unwrap();
+                } else {
+                    tx.send(UsbMessage::Disconnected).unwrap();
+                }
+                app.process_messages();
+                if manual_pause {
+                    assert_eq!(app.recording_phase, RecordingPhase::Paused);
+                    assert_eq!(app.pause_reason, Some(PauseReason::Manual));
+                } else if restart_success {
+                    assert_eq!(app.recording_phase, RecordingPhase::Recording);
+                } else {
+                    assert_eq!(app.recording_phase, RecordingPhase::WaitingForReconnect);
+                    assert_eq!(app.pause_reason, Some(PauseReason::UsbDisconnected));
+                }
+                app.stop_recording();
+                let destination = root.join(format!("export.{}", format.extension()));
+                app.pending_save_destination = Some(destination.clone());
+                app.recording_phase = RecordingPhase::Finalizing;
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while app.recording_phase != RecordingPhase::Saved && Instant::now() < deadline {
+                    app.poll_recording();
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                assert_eq!(app.recording_phase, RecordingPhase::Saved, "{}", app.recording_status);
+                let imported = recording_import::load_recording(&destination).unwrap();
+                let saved = imported.metadata.as_ref().unwrap();
+                let expected_seconds = if restart_success && !manual_pause { 1.0 } else { 0.5 };
+                assert_eq!(imported.samples.len(), if expected_seconds == 1.0 { 4 } else { 2 });
+                assert_eq!(saved.effective_duration_us, (expected_seconds * 1e6) as u64);
+                assert!((saved.cumulative_energy_uwh - 20.0 * expected_seconds / 3600.0 * 1e6).abs() < 0.01);
+                // No samples or energy are fabricated for the unknown interval.
+                assert_eq!(saved.missing_samples, 0);
+                if manual_pause {
+                    assert!(saved.disconnect_intervals.is_empty());
+                    assert_eq!(saved.pause_intervals.len(), 1);
+                } else {
+                    assert_eq!(saved.disconnect_intervals.len(), 1);
+                    assert!(saved.disconnected_duration_ms >= 3500);
+                    assert!(saved.disconnect_intervals[0].ended_at_utc.is_some());
+                    assert_eq!(saved.disconnect_intervals[0].reason, IntervalReason::UsbDisconnected);
+                    assert!(app.recording_status.contains("采集中断"));
+                }
+                assert!(
+                    saved
+                        .pause_intervals
+                        .iter()
+                        .all(|interval| interval.ended_at_utc.is_some())
+                );
+                drop(app);
+                std::fs::remove_dir_all(root).unwrap();
+            }
+        }
     }
 
     #[test]

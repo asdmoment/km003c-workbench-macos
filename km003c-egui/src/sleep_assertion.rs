@@ -124,6 +124,7 @@ mod tests {
         assert!(!assertion.is_active());
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn streaming_activity_can_be_held_and_dropped() {
         let first = StreamingActivity::begin();
