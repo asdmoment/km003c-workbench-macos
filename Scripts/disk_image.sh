@@ -7,7 +7,8 @@
 # DISK_IMAGE_TOOL=hdiutil forces the fallback, e.g. to test it on a new host.
 
 if [[ -z "${DISK_IMAGE_TOOL:-}" ]]; then
-  if diskutil image create from --help >/dev/null 2>&1; then
+  # Older image subcommands can convert disks but cannot package a folder.
+  if disk_image_create_help="$(diskutil image create from --help 2>&1)" && [[ "$disk_image_create_help" == *--volumeName* ]]; then
     DISK_IMAGE_TOOL="diskutil"
   else
     DISK_IMAGE_TOOL="hdiutil"
